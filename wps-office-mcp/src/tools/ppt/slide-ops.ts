@@ -1486,12 +1486,18 @@ export const setBackgroundHandler: ToolHandler = async (
   };
 
   try {
+    // 跨平台参数对齐：Windows setSlideBackground 读取 $p.imagePath；同时发送 path/filePath 别名兜底跨实现差异
     const response = await wpsClient.executeMethod<{
       success: boolean;
       message: string;
     }>(
       'setSlideBackground',
-      { slideIndex, color, imagePath },
+      {
+        slideIndex,
+        color,
+        imagePath,
+        ...(imagePath ? { path: imagePath, filePath: imagePath } : {}),
+      },
       WpsAppType.PRESENTATION
     );
 

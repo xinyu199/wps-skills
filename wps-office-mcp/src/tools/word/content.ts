@@ -476,12 +476,13 @@ export const insertImageHandler: ToolHandler = async (
   }
 
   try {
+    // 跨平台参数对齐：macOS/Windows 底层均优先读取 params.path，同时保留 imagePath/filePath 别名
     const response = await wpsClient.executeMethod<{
       success: boolean;
       message: string;
     }>(
       'insertImage',
-      { imagePath, width, height },
+      { imagePath, path: imagePath, filePath: imagePath, width, height },
       WpsAppType.WRITER
     );
 

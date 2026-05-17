@@ -177,6 +177,9 @@ export const convertToPdfHandler: ToolHandler = async (
       'convertToPDF',
       {
         outputPath: outputPath || '',
+        // 跨平台参数对齐：补齐 path/filePath 别名，避免底层只读取单一字段名导致路径丢失
+        path: outputPath || '',
+        filePath: outputPath || '',
         openAfterExport: openAfterExport || false,
       }
       // 不指定appType，让WPS加载项自动检测当前活动的应用
@@ -289,6 +292,9 @@ export const convertFormatHandler: ToolHandler = async (
       {
         targetFormat: targetFormat.toLowerCase().replace(/^\./, ''), // 去掉开头的点
         outputPath: outputPath || '',
+        // 跨平台参数对齐：补齐 path/filePath 别名，避免底层只读取单一字段名导致路径丢失
+        path: outputPath || '',
+        filePath: outputPath || '',
       }
       // 不指定appType，让WPS加载项自动检测
     );

@@ -81,13 +81,14 @@ export const insertPptImageHandler: ToolHandler = async (
   };
 
   try {
+    // 跨平台参数对齐：macOS/Windows 底层均读取 params.path，需同时发送 path/imagePath 别名
     const response = await wpsClient.executeMethod<{
       success: boolean;
       message: string;
       imageIndex?: number;
     }>(
       'insertPptImage',
-      { slideIndex, filePath, left, top, width, height },
+      { slideIndex, filePath, path: filePath, imagePath: filePath, left, top, width, height },
       WpsAppType.PRESENTATION
     );
 

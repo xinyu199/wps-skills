@@ -235,12 +235,13 @@ export const setBackgroundImageHandler: ToolHandler = async (
   };
 
   try {
+    // 跨平台参数对齐：macOS/Windows 底层均读取 params.path，需同时发送 path/filePath 别名
     const response = await wpsClient.executeMethod<{
       success: boolean;
       message: string;
     }>(
       'setBackgroundImage',
-      { slideIndex, imagePath },
+      { slideIndex, imagePath, path: imagePath, filePath: imagePath },
       WpsAppType.PRESENTATION
     );
 

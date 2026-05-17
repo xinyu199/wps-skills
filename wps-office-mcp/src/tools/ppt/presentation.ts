@@ -124,6 +124,7 @@ export const openPresentationHandler: ToolHandler = async (
   };
 
   try {
+    // 跨平台参数对齐：macOS/Windows 底层均读取 params.path，需同时发送 path 别名
     const response = await wpsClient.executeMethod<{
       success: boolean;
       message: string;
@@ -131,7 +132,7 @@ export const openPresentationHandler: ToolHandler = async (
       filePath: string;
     }>(
       'openPresentation',
-      { filePath },
+      { filePath, path: filePath },
       WpsAppType.PRESENTATION
     );
 
@@ -587,12 +588,13 @@ export const insertSlideImageHandler: ToolHandler = async (
   };
 
   try {
+    // 跨平台参数对齐：底层 insertImage handler 读取 path/filePath，需同时发送别名
     const response = await wpsClient.executeMethod<{
       success: boolean;
       message: string;
     }>(
       'insertImage',
-      { slideIndex, imagePath, left, top },
+      { slideIndex, imagePath, path: imagePath, filePath: imagePath, left, top },
       WpsAppType.PRESENTATION
     );
 
