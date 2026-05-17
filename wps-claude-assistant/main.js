@@ -3160,11 +3160,19 @@ function handleSetSlideBackground(params) {
         if (!ppt) return { success: false, error: '没有打开的演示文稿' };
         var index = params.slideIndex || 1;
         var slide = ppt.Slides.Item(index);
+        var imagePath = params.imagePath || params.path || params.filePath;
+        if (!params.color && !imagePath) {
+            return { success: false, error: '请提供背景图片路径或颜色' };
+        }
         if (params.color) {
             var c = params.color.replace('#', '');
             slide.FollowMasterBackground = false;
             slide.Background.Fill.Solid();
             slide.Background.Fill.ForeColor.RGB = parseInt(c.substr(0, 2), 16) + parseInt(c.substr(2, 2), 16) * 256 + parseInt(c.substr(4, 2), 16) * 65536;
+        }
+        if (imagePath) {
+            slide.FollowMasterBackground = false;
+            slide.Background.Fill.UserPicture(imagePath);
         }
         return { success: true, data: { slideIndex: index } };
     } catch (e) {
