@@ -20,7 +20,7 @@ import { pptTools } from './ppt';
 import { commonTools } from './common';
 
 /**
- * 所有MCP Tools集合（共224个，另有12个内置工具在mcp-server.ts中注册，全局共236个）
+ * 所有MCP Tools集合（共225个，另有12个内置工具在mcp-server.ts中注册，全局共237个）
  *
  * Excel (80个):
  *   公式(6): set_formula, generate_formula, diagnose_formula, set_array_formula, recalculate, auto_sum
@@ -37,7 +37,7 @@ import { commonTools } from './common';
  *   内容(10): insert_text, find_replace, insert_table, set_paragraph, get_active_document, insert_image, add_comment, insert_hyperlink, get_word_count, insert_page_break
  *   文档管理(9): get_open_documents, switch_document, open_document, get_document_text, insert_header, insert_footer, generate_doc_toc, create_document, save_document
  *
- * PPT (111个):
+ * PPT (112个):
  *   幻灯片(5): add_slide, beautify, unify_font, set_font_color, align_objects
  *   幻灯片操作(22): delete_slide, duplicate_slide, move_slide, get_slide_count, get_slide_info, switch_slide, set_slide_layout, get_slide_notes, set_slide_notes, add_shape, set_shape_style, add_textbox, set_slide_title, insert_image, set_shape_text, set_animation, set_background, set_slide_size, set_transition, add_chart, set_shape_fill, add_speaker_notes
  *   演示文稿管理(8): create_presentation, open_presentation, close_presentation, get_open_presentations, switch_presentation, set_slide_theme, copy_slide, insert_slide_image

@@ -1,14 +1,15 @@
 /**
- * Input: PPT 图片操作参数（插入、删除、样式设置）
+ * Input: PPT 图片操作参数（插入、删除、样式设置、幻灯片导出为图片）
  * Output: 图片操作结果
  * Pos: PPT 图片工具实现。一旦我被修改，请更新我的头部注释，以及所属文件夹的md。
  * PPT图片Tools - 图片管理模块
- * 处理图片的插入、删除和样式设置操作
+ * 处理图片的插入、删除、样式设置以及幻灯片导出为位图操作
  *
  * 包含：
  * - wps_ppt_insert_ppt_image: 插入图片到幻灯片
  * - wps_ppt_delete_ppt_image: 删除幻灯片中的图片
  * - wps_ppt_set_image_style: 设置图片样式
+ * - wps_ppt_export_slide_as_image: 将指定幻灯片导出为位图图片（PNG/JPG/GIF/BMP）
  */
 
 import { v4 as uuidv4 } from 'uuid';
@@ -313,6 +314,130 @@ export const setImageStyleHandler: ToolHandler = async (
   }
 };
 
+// ==================== 4. 导出幻灯片为图片 ====================
+
+export const exportSlideAsImageDefinition: ToolDefinition = {
+  name: 'wps_ppt_export_slide_as_image',
+  description: `将指定幻灯片导出为位图图片（PNG/JPG/JPEG/GIF/BMP）。
+
+调用底层 WPS PowerPoint 原生接口 Slide.Export(FileName, FilterName, ScaleWidth, ScaleHeight)，
+实现 1:1 像素级还原，避免通过 PDF 中转再转图片造成的版式/字体/形状失真问题。
+
+支持的 format（FilterName）取值：
+- PNG（默认，推荐用于截图与无损展示）
+- JPG / JPEG（自动按 JPG 滤镜处理，体积更小）
+- GIF（限 256 色，适合简单图形）
+- BMP（无压缩位图，文件最大）
+
+使用场景：
+- "把第3页 PPT 导出成 PNG 给我"
+- "导出整个演示文稿每一页为 1920x1080 的 JPG"
+- "把封面页保存为高清图片用于网页"
+
+注意：
+- outputPath 必须是绝对路径
+- macOS 上建议输出到 ~/Downloads 或用户可写目录，避免沙箱权限拒绝
+- 不指定 width/height 时使用 1280x720（16:9 默认尺寸）`,
+  category: ToolCategory.PRESENTATION,
+  inputSchema: {
+    type: 'object',
+    properties: {
+      slideIndex: {
+        type: 'number',
+        description: '幻灯片序号（从1开始）',
+      },
+      outputPath: {
+        type: 'string',
+        description: '输出图片文件的绝对路径（如 /Users/xxx/Downloads/slide1.png）',
+      },
+      format: {
+        type: 'string',
+        enum: ['PNG', 'JPG', 'JPEG', 'GIF', 'BMP'],
+        description: '图片格式，默认 PNG',
+      },
+      width: {
+        type: 'number',
+        description: '输出图片宽度（像素），默认 1280',
+      },
+      height: {
+        type: 'number',
+        description: '输出图片高度（像素），默认 720',
+      },
+    },
+    required: ['slideIndex', 'outputPath'],
+  },
+};
+
+export const exportSlideAsImageHandler: ToolHandler = async (
+  args: Record<string, unknown>
+): Promise<ToolCallResult> => {
+  const { slideIndex, outputPath, format, width, height } = args as {
+    slideIndex: number;
+    outputPath: string;
+    format?: string;
+    width?: number;
+    height?: number;
+  };
+
+  // 归一化 format：JPEG 在 WPS COM 中实际对应 JPG 滤镜
+  const rawFormat = (format || 'PNG').toUpperCase();
+  const filterName = rawFormat === 'JPEG' ? 'JPG' : rawFormat;
+  const finalWidth = width || 1280;
+  const finalHeight = height || 720;
+
+  try {
+    const response = await wpsClient.executeMethod<{
+      success: boolean;
+      message?: string;
+      slideIndex?: number;
+      outputPath?: string;
+      format?: string;
+    }>(
+      'exportSlideAsImage',
+      {
+        slideIndex,
+        outputPath,
+        // 跨平台参数对齐：macOS/Windows 底层兼容 path/outputPath 双别名
+        path: outputPath,
+        format: filterName,
+        width: finalWidth,
+        height: finalHeight,
+      },
+      WpsAppType.PRESENTATION
+    );
+
+    if (response.success) {
+      const text =
+        `幻灯片导出图片成功！\n` +
+        `幻灯片: 第 ${slideIndex} 页\n` +
+        `格式: ${filterName}\n` +
+        `尺寸: ${finalWidth} x ${finalHeight}\n` +
+        `输出路径: ${outputPath}`;
+
+      return {
+        id: uuidv4(),
+        success: true,
+        content: [{ type: 'text', text }],
+      };
+    } else {
+      return {
+        id: uuidv4(),
+        success: false,
+        content: [{ type: 'text', text: `导出幻灯片为图片失败: ${response.error}` }],
+        error: response.error,
+      };
+    }
+  } catch (error) {
+    const errMsg = error instanceof Error ? error.message : String(error);
+    return {
+      id: uuidv4(),
+      success: false,
+      content: [{ type: 'text', text: `导出幻灯片为图片出错: ${errMsg}` }],
+      error: errMsg,
+    };
+  }
+};
+
 /**
  * 导出所有图片相关的Tools
  */
@@ -320,6 +445,7 @@ export const imageTools: RegisteredTool[] = [
   { definition: insertPptImageDefinition, handler: insertPptImageHandler },
   { definition: deletePptImageDefinition, handler: deletePptImageHandler },
   { definition: setImageStyleDefinition, handler: setImageStyleHandler },
+  { definition: exportSlideAsImageDefinition, handler: exportSlideAsImageHandler },
 ];
 
 export default imageTools;

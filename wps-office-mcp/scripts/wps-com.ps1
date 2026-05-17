@@ -2604,6 +2604,23 @@ switch ($Action) {
         Output-Json @{ success = $true; data = @{ name = $shape.Name } }
     }
 
+    "exportSlideAsImage" {
+        $ppt = Get-WpsPpt
+        if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
+        $pres = $ppt.ActivePresentation
+        $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
+        $slide = $pres.Slides.Item($slideIndex)
+        $outputPath = if ($p.outputPath) { $p.outputPath } else { $p.path }
+        if ([string]::IsNullOrEmpty($outputPath)) { Output-Json @{ success = $false; error = "Missing outputPath" }; exit }
+        $rawFormat = if ($p.format) { $p.format.ToString().ToUpper() } else { "PNG" }
+        # JPEG 在 PowerPoint COM 中按 JPG 滤镜处理
+        $filterName = if ($rawFormat -eq "JPEG") { "JPG" } else { $rawFormat }
+        $width = if ($p.width) { $p.width } else { 1280 }
+        $height = if ($p.height) { $p.height } else { 720 }
+        $slide.Export($outputPath, $filterName, $width, $height)
+        Output-Json @{ success = $true; data = @{ slideIndex = $slideIndex; outputPath = $outputPath; format = $filterName; width = $width; height = $height } }
+    }
+
     "insertPptTable" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }

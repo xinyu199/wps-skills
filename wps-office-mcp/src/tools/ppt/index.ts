@@ -17,7 +17,7 @@
  * - 形状基础Tools: delete_shape, get_shapes, set_shape_position, set_shape_shadow,
  *   set_shape_gradient, set_shape_border, set_shape_transparency, align_shapes,
  *   distribute_shapes, group_shapes
- * - 图片Tools: insert_ppt_image, delete_ppt_image, set_image_style
+ * - 图片Tools: insert_ppt_image, delete_ppt_image, set_image_style, export_slide_as_image
  * - 动画与切换Tools: add_animation, remove_animation, get_animations, set_animation_order,
  *   add_animation_preset, add_emphasis_animation, set_slide_transition, remove_slide_transition, apply_transition_to_all
  * - 图表与流程图Tools: insert_ppt_chart, set_ppt_chart_data, set_ppt_chart_style,
@@ -233,6 +233,8 @@ export {
   deletePptImageHandler,
   setImageStyleDefinition,
   setImageStyleHandler,
+  exportSlideAsImageDefinition,
+  exportSlideAsImageHandler,
 } from './image';
 
 export {

@@ -329,6 +329,9 @@ function handleCommand(cmd) {
             case 'setImageStyle':
                 result = handleSetImageStyle(cmd.params);
                 break;
+            case 'exportSlideAsImage':
+                result = handleExportSlideAsImage(cmd.params);
+                break;
 
             // PPT 表格操作
             case 'insertPptTable':
@@ -1925,6 +1928,38 @@ function handleSetImageStyle(params) {
         return { success: true, data: { name: shape.Name } };
     } catch (e) {
         return { success: false, error: e.message };
+    }
+}
+
+// 导出幻灯片为位图图片（PNG/JPG/GIF/BMP）
+// 调用 WPS PowerPoint 原生 Slide.Export(FileName, FilterName, ScaleWidth, ScaleHeight)
+// 1:1 像素级还原，避免 PDF 中转造成的版式失真
+function handleExportSlideAsImage(params) {
+    try {
+        var pres = Application.ActivePresentation;
+        if (!pres) return { success: false, error: '没有打开的演示文稿' };
+        var slideIndex = params.slideIndex || 1;
+        var slide = pres.Slides.Item(slideIndex);
+        var outputPath = params.outputPath || params.path;
+        if (!outputPath) return { success: false, error: '缺少输出路径 outputPath' };
+        var rawFormat = (params.format || 'PNG').toString().toUpperCase();
+        // JPEG 在底层 COM 中按 JPG 滤镜处理
+        var filterName = rawFormat === 'JPEG' ? 'JPG' : rawFormat;
+        var width = params.width || 1280;
+        var height = params.height || 720;
+        slide.Export(outputPath, filterName, width, height);
+        return {
+            success: true,
+            data: {
+                slideIndex: slideIndex,
+                outputPath: outputPath,
+                format: filterName,
+                width: width,
+                height: height
+            }
+        };
+    } catch (e) {
+        return { success: false, error: '导出幻灯片为图片失败: ' + e.message };
     }
 }
 
