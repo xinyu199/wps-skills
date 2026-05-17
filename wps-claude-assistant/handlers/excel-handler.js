@@ -230,6 +230,83 @@ function removeDuplicates(params) {
     }
 }
 
+// 导出图表为图片（Chart.Export 原生 API）
+// 调用 chartObj.Chart.Export(FileName, FilterName) 实现 1:1 像素级图表导出
+function exportChartAsImage(params) {
+    try {
+        var wb = Application.ActiveWorkbook;
+        if (!wb) return { success: false, error: '没有打开的工作簿' };
+        var sheet = getSheet(wb, params.sheet);
+        var outputPath = params.outputPath || params.path;
+        if (!outputPath) return { success: false, error: '缺少输出路径 outputPath' };
+        var chartName = params.chartName;
+        if (!chartName) return { success: false, error: '缺少图表名 chartName' };
+        var rawFormat = (params.format || 'PNG').toString().toUpperCase();
+        // JPEG 在底层 COM 中按 JPG 滤镜处理
+        var filterName = rawFormat === 'JPEG' ? 'JPG' : rawFormat;
+
+        var chartObj = sheet.ChartObjects(chartName);
+        chartObj.Chart.Export(outputPath, filterName);
+        return {
+            success: true,
+            data: {
+                chartName: chartName,
+                outputPath: outputPath,
+                format: filterName
+            }
+        };
+    } catch (e) {
+        return { success: false, error: '导出图表为图片失败: ' + e.message };
+    }
+}
+
+// 导出区域为图片（Range.CopyPicture + 临时 ChartObject + Chart.Export 经典做法）
+// 1. range.CopyPicture(xlScreen=1, xlBitmap=2) 复制区域到剪贴板
+// 2. ChartObjects.Add(0, 0, range.Width, range.Height) 创建同尺寸临时图表
+// 3. tempChart.Chart.Paste() 把剪贴板位图贴入图表
+// 4. tempChart.Chart.Export(outputPath, filterName) 导出
+// 5. tempChart.Delete() 清理临时图表
+function exportRangeAsImage(params) {
+    var tempChart = null;
+    try {
+        var wb = Application.ActiveWorkbook;
+        if (!wb) return { success: false, error: '没有打开的工作簿' };
+        var sheet = getSheet(wb, params.sheet);
+        var outputPath = params.outputPath || params.path;
+        if (!outputPath) return { success: false, error: '缺少输出路径 outputPath' };
+        if (!params.range) return { success: false, error: '缺少区域 range' };
+        var rawFormat = (params.format || 'PNG').toString().toUpperCase();
+        var filterName = rawFormat === 'JPEG' ? 'JPG' : rawFormat;
+
+        var range = sheet.Range(params.range);
+        // xlScreen=1 (Appearance), xlBitmap=2 (Format)
+        range.CopyPicture(1, 2);
+
+        // 创建同尺寸临时 ChartObject 承载剪贴板位图
+        tempChart = sheet.ChartObjects().Add(0, 0, range.Width, range.Height);
+        tempChart.Activate();
+        tempChart.Chart.Paste();
+        tempChart.Chart.Export(outputPath, filterName);
+        tempChart.Delete();
+        tempChart = null;
+
+        return {
+            success: true,
+            data: {
+                range: params.range,
+                outputPath: outputPath,
+                format: filterName
+            }
+        };
+    } catch (e) {
+        // 异常清理：如果临时图表未删除，尝试回滚
+        if (tempChart) {
+            try { tempChart.Delete(); } catch (cleanupErr) {}
+        }
+        return { success: false, error: '导出区域为图片失败: ' + e.message };
+    }
+}
+
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
         getActiveWorkbook: getActiveWorkbook,
@@ -242,6 +319,8 @@ if (typeof module !== 'undefined' && module.exports) {
         sortRange: sortRange,
         autoFilter: autoFilter,
         createChart: createChart,
-        removeDuplicates: removeDuplicates
+        removeDuplicates: removeDuplicates,
+        exportChartAsImage: exportChartAsImage,
+        exportRangeAsImage: exportRangeAsImage
     };
 }

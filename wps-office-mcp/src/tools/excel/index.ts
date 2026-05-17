@@ -24,7 +24,7 @@ import { commentProtectTools } from './comment-protect';
  * - 公式Tools: set_formula, generate_formula, diagnose_formula
  * - 数据Tools: read_range, write_range, clean_data, remove_duplicates, sort_range, find_replace, insert_row, add_comment, protect_sheet, set_conditional_format
  * - 透视表Tools: create_pivot_table, update_pivot_table
- * - 图表Tools: create_chart, update_chart
+ * - 图表Tools: create_chart, update_chart, export_chart_as_image, export_range_as_image
  * - 工作表Tools: create_sheet, delete_sheet, rename_sheet, copy_sheet, get_sheet_list, switch_sheet, move_sheet, get_selection, delete_row, insert_column, delete_column, freeze_panes, auto_fill, set_named_range
  * - 格式化Tools: set_cell_format, set_cell_style, set_border, set_number_format, merge_cells, unmerge_cells, set_column_width, set_row_height
  * - 行列Tools: insert_rows, insert_columns, delete_rows, delete_columns, hide_rows, show_rows, show_columns, group_rows
@@ -110,6 +110,10 @@ export {
   createChartHandler,
   updateChartDefinition,
   updateChartHandler,
+  exportChartAsImageDefinition,
+  exportChartAsImageHandler,
+  exportRangeAsImageDefinition,
+  exportRangeAsImageHandler,
 } from './chart';
 
 export {

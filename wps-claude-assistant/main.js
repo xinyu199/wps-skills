@@ -635,6 +635,12 @@ function handleCommand(cmd) {
             case 'updateChart':
                 result = handleUpdateChart(cmd.params);
                 break;
+            case 'exportChartAsImage':
+                result = handleExportChartAsImage(cmd.params);
+                break;
+            case 'exportRangeAsImage':
+                result = handleExportRangeAsImage(cmd.params);
+                break;
             case 'createPivotTable':
                 result = handleCreatePivotTable(cmd.params);
                 break;
@@ -5401,6 +5407,86 @@ function handleInsertExcelImage(params) {
         return { success: true, data: { name: pic.Name, path: params.path } };
     } catch (e) {
         return { success: false, error: e.message };
+    }
+}
+
+// 导出图表为图片（Chart.Export 原生 API）
+// 调用 chartObj.Chart.Export(FileName, FilterName) 实现 1:1 像素级图表导出，
+// 避免通过 PDF + pdf2image 中转造成的版式/字体/坐标轴失真
+function handleExportChartAsImage(params) {
+    try {
+        var wb = Application.ActiveWorkbook;
+        if (!wb) return { success: false, error: '没有打开的工作簿' };
+        var sheet = params.sheet ? wb.Sheets.Item(params.sheet) : wb.ActiveSheet;
+        var outputPath = params.outputPath || params.path;
+        if (!outputPath) return { success: false, error: '缺少输出路径 outputPath' };
+        var chartName = params.chartName;
+        if (!chartName) return { success: false, error: '缺少图表名 chartName' };
+        var rawFormat = (params.format || 'PNG').toString().toUpperCase();
+        // JPEG 在底层 COM 中按 JPG 滤镜处理
+        var filterName = rawFormat === 'JPEG' ? 'JPG' : rawFormat;
+
+        var chartObj = sheet.ChartObjects(chartName);
+        chartObj.Chart.Export(outputPath, filterName);
+        return {
+            success: true,
+            data: {
+                chartName: chartName,
+                outputPath: outputPath,
+                format: filterName
+            }
+        };
+    } catch (e) {
+        return { success: false, error: '导出图表为图片失败: ' + e.message };
+    }
+}
+
+// 导出区域为图片（Range.CopyPicture + 临时 ChartObject + Chart.Export 经典做法）
+// 步骤：
+// 1. range.CopyPicture(xlScreen=1, xlBitmap=2) 复制区域到剪贴板
+// 2. ChartObjects.Add(0, 0, range.Width, range.Height) 创建同尺寸临时图表
+// 3. tempChart.Chart.Paste() 把剪贴板位图贴入图表
+// 4. tempChart.Chart.Export(outputPath, filterName) 导出
+// 5. tempChart.Delete() 清理临时图表
+// 注意：headless 模式或剪贴板冲突时可能失败，已包含异常清理
+function handleExportRangeAsImage(params) {
+    var tempChart = null;
+    try {
+        var wb = Application.ActiveWorkbook;
+        if (!wb) return { success: false, error: '没有打开的工作簿' };
+        var sheet = params.sheet ? wb.Sheets.Item(params.sheet) : wb.ActiveSheet;
+        var outputPath = params.outputPath || params.path;
+        if (!outputPath) return { success: false, error: '缺少输出路径 outputPath' };
+        if (!params.range) return { success: false, error: '缺少区域 range' };
+        var rawFormat = (params.format || 'PNG').toString().toUpperCase();
+        var filterName = rawFormat === 'JPEG' ? 'JPG' : rawFormat;
+
+        var range = sheet.Range(params.range);
+        // xlScreen=1 (Appearance), xlBitmap=2 (Format)
+        range.CopyPicture(1, 2);
+
+        // 创建同尺寸临时 ChartObject 承载剪贴板位图
+        tempChart = sheet.ChartObjects().Add(0, 0, range.Width, range.Height);
+        tempChart.Activate();
+        tempChart.Chart.Paste();
+        tempChart.Chart.Export(outputPath, filterName);
+        tempChart.Delete();
+        tempChart = null;
+
+        return {
+            success: true,
+            data: {
+                range: params.range,
+                outputPath: outputPath,
+                format: filterName
+            }
+        };
+    } catch (e) {
+        // 异常清理：剪贴板冲突或粘贴失败时回滚临时图表
+        if (tempChart) {
+            try { tempChart.Delete(); } catch (cleanupErr) {}
+        }
+        return { success: false, error: '导出区域为图片失败: ' + e.message };
     }
 }
 

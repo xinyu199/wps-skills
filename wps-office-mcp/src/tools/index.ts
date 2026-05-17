@@ -20,12 +20,12 @@ import { pptTools } from './ppt';
 import { commonTools } from './common';
 
 /**
- * 所有MCP Tools集合（共225个，另有12个内置工具在mcp-server.ts中注册，全局共237个）
+ * 所有MCP Tools集合（共227个，另有12个内置工具在mcp-server.ts中注册，全局共239个）
  *
- * Excel (80个):
+ * Excel (82个):
  *   公式(6): set_formula, generate_formula, diagnose_formula, set_array_formula, recalculate, auto_sum
  *   数据(12): read_range, write_range, clean_data, remove_duplicates, sort_range, find_replace, insert_row, add_comment, protect_sheet, set_conditional_format, hide_column, protect_workbook
- *   图表(2): create_chart, update_chart
+ *   图表(4): create_chart, update_chart, export_chart_as_image, export_range_as_image
  *   透视表(2): create_pivot_table, update_pivot_table
  *   工作表(16): create_sheet, delete_sheet, rename_sheet, copy_sheet, get_sheet_list, switch_sheet, move_sheet, get_selection, delete_row, insert_column, delete_column, freeze_panes, auto_fill, set_named_range, set_zoom, save_workbook
  *   格式化(10): set_cell_format, set_cell_style, set_border, set_number_format, merge_cells, unmerge_cells, set_column_width, set_row_height, auto_fit_column, auto_fit_row

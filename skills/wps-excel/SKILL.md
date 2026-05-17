@@ -259,14 +259,20 @@ description: WPS 表格智能助手，通过自然语言操控 Excel，解决公
 | `wps_excel_text_to_columns` | 将文本按分隔符拆分到多列 |
 | `wps_excel_subtotal` | 创建分类汇总 |
 
-### 图表工具（2个）
+### 图表工具（4个）
 
 | MCP工具 | 功能描述 |
 |---------|---------|
 | `wps_excel_create_chart` | 在Excel中创建图表（柱状图/折线图/饼图/散点图等） |
 | `wps_excel_update_chart` | 更新Excel图表的属性（标题/颜色/图例/数据标签等） |
+| `wps_excel_export_chart_as_image` | 将工作表中的图表导出为 PNG/JPG/GIF/BMP 位图（Chart.Export 原生 API，1:1 像素级还原，替代 pdf2image 中转） |
+| `wps_excel_export_range_as_image` | 将指定区域（如 A1:F20）导出为 PNG/JPG/GIF/BMP 位图（CopyPicture + 临时图表经典做法，1:1 还原表格视觉） |
 
 支持的图表类型：column_clustered, column_stacked, bar_clustered, line, line_markers, pie, doughnut, scatter, area, radar
+
+> 图表导出示例：`wps_excel_export_chart_as_image({ chartName: "Chart 1", outputPath: "/Users/me/Downloads/chart1.png", format: "PNG" })` — 适用于"把销售柱状图导成 PNG""把图表保存成高清图片用于报告"等场景。
+
+> 区域导出示例：`wps_excel_export_range_as_image({ range: "A1:F20", outputPath: "/Users/me/Downloads/table.png", format: "PNG" })` — 适用于"把表格区域保存为图片""导出数据区贴到 PPT"等场景。注意此方法依赖剪贴板，headless 模式下可能失败。
 
 ### 透视表工具（2个）
 
