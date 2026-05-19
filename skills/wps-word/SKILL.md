@@ -82,6 +82,14 @@ description: WPS 文字智能助手，通过自然语言操控 Word 文档，解
 - `wps_word_insert_page_break`：插入分页符
 - `wps_word_insert_bookmark`：插入书签（name）
 
+**模板填写与文档分析（v2 新增，目前 Windows 优先支持）：**
+- `wps_word_get_paragraphs`：获取段落结构（start_paragraph, end_paragraph）— 了解模板结构、识别填写位置
+- `wps_word_find_in_document`：查找文本位置（find_text, match_case, match_whole_word, max_results）— 仅返回位置不替换
+- `wps_word_smart_fill_field`：智能填写模板字段（keyword, value, fill_mode）— 自动识别下划线/冒号/标签/占位符等填写模式
+- `wps_word_replace_bookmark_content`：替换书签内容（name, text）— 保持原有格式
+
+> 💡 模板填写场景应优先使用 `smart_fill_field`，而非 `find_replace`。后者会删除关键字本身并可能破坏格式。常用工作流：先 `find_in_document` 定位关键字 → 再 `smart_fill_field` 填值。
+
 **格式设置：**
 - `wps_word_set_font`：设置字体格式（font_name, font_size, bold, italic, underline, color, range）
 - `wps_word_apply_style`：应用样式（style_name, range）

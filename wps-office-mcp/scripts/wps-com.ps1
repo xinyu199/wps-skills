@@ -2104,6 +2104,207 @@ switch ($Action) {
         Output-Json @{ success = $true; data = @{ bookmarks = $bookmarks; count = $bookmarks.Count } }
     }
 
+    "getDocumentParagraphs" {
+        $word = Get-WpsWord
+        if ($null -eq $word) { Output-Json @{ success = $false; error = "WPS Word not running" }; exit }
+        $doc = $word.ActiveDocument
+        if ($null -eq $doc) { Output-Json @{ success = $false; error = "No active document" }; exit }
+        $startIdx = if ($null -ne $p.startParagraph) { [int]$p.startParagraph } else { 1 }
+        $endIdx = if ($null -ne $p.endParagraph) { [int]$p.endParagraph } else { [Math]::Min($doc.Paragraphs.Count, $startIdx + 49) }
+        if ($endIdx -gt $doc.Paragraphs.Count) { $endIdx = $doc.Paragraphs.Count }
+        $paragraphs = @()
+        for ($i = $startIdx; $i -le $endIdx; $i++) {
+            $para = $doc.Paragraphs.Item($i)
+            $text = $para.Range.Text
+            $text = $text.TrimEnd("`r`n", "`r", "`n")
+            if ($text.Length -gt 200) { $text = $text.Substring(0, 200) + "..." }
+            $styleName = ""
+            try { $styleName = $para.Range.Style.NameLocal } catch { $styleName = "" }
+            $paragraphs += @{ index = $i; text = $text; style = $styleName; start = $para.Range.Start; end = $para.Range.End }
+        }
+        Output-Json @{ success = $true; data = @{ paragraphs = $paragraphs; totalCount = $doc.Paragraphs.Count; returnedCount = $paragraphs.Count } }
+    }
+
+    "findInDocument" {
+        $word = Get-WpsWord
+        if ($null -eq $word) { Output-Json @{ success = $false; error = "WPS Word not running" }; exit }
+        $doc = $word.ActiveDocument
+        if ($null -eq $doc) { Output-Json @{ success = $false; error = "No active document" }; exit }
+        if (-not $p.findText) { Output-Json @{ success = $false; error = "findText required" }; exit }
+        $matchCase = if ($null -ne $p.matchCase) { [bool]$p.matchCase } else { $false }
+        $matchWholeWord = if ($null -ne $p.matchWholeWord) { [bool]$p.matchWholeWord } else { $false }
+        $maxResults = if ($null -ne $p.maxResults) { [int]$p.maxResults } else { 20 }
+        $results = @()
+        $searchRange = $doc.Content.Duplicate
+        $searchRange.Find.ClearFormatting()
+        $searchRange.Find.Text = $p.findText
+        $found = $searchRange.Find.Execute($p.findText, $matchCase, $matchWholeWord, $false, $false, $false, $true, 1, $false, "", 0)
+        while ($found -and $results.Count -lt $maxResults) {
+            $matchStart = $searchRange.Start
+            $matchEnd = $searchRange.End
+            $matchText = $searchRange.Text
+            $paraIdx = 0
+            for ($pi = 1; $pi -le $doc.Paragraphs.Count; $pi++) {
+                $pr = $doc.Paragraphs.Item($pi).Range
+                if ($matchStart -ge $pr.Start -and $matchStart -le $pr.End) { $paraIdx = $pi; break }
+            }
+            $ctxStart = [Math]::Max(0, $matchStart - 50)
+            $ctxEnd = [Math]::Min($doc.Content.End, $matchEnd + 50)
+            $ctxRange = $doc.Range($ctxStart, $ctxEnd)
+            $context = $ctxRange.Text
+            $results += @{ text = $matchText; start = $matchStart; end = $matchEnd; paragraphIndex = $paraIdx; context = $context }
+            $searchRange = $doc.Range($matchEnd, $doc.Content.End)
+            $searchRange.Find.ClearFormatting()
+            $searchRange.Find.Text = $p.findText
+            $found = $searchRange.Find.Execute($p.findText, $matchCase, $matchWholeWord, $false, $false, $false, $true, 1, $false, "", 0)
+        }
+        Output-Json @{ success = $true; data = @{ results = $results; count = $results.Count; findText = $p.findText } }
+    }
+
+    "smartFillField" {
+        $word = Get-WpsWord
+        if ($null -eq $word) { Output-Json @{ success = $false; error = "WPS Word not running" }; exit }
+        $doc = $word.ActiveDocument
+        if ($null -eq $doc) { Output-Json @{ success = $false; error = "No active document" }; exit }
+        if (-not $p.keyword) { Output-Json @{ success = $false; error = "keyword required" }; exit }
+        if ($null -eq $p.value) { Output-Json @{ success = $false; error = "value required（空字符串将清除该字段内容）" }; exit }
+        $fillMode = if ($p.fillMode) { $p.fillMode.ToLower() } else { "auto" }
+
+        $searchRange = $doc.Content.Duplicate
+        $searchRange.Find.ClearFormatting()
+        $searchRange.Find.Text = $p.keyword
+        $found = $searchRange.Find.Execute($p.keyword, $false, $false, $false, $false, $false, $true, 1, $false, "", 0)
+        if (-not $found) { Output-Json @{ success = $false; error = "Keyword '$($p.keyword)' not found" }; exit }
+
+        $matchStart = $searchRange.Start
+        $matchEnd = $searchRange.End
+        $paraRange = $searchRange.Paragraphs.Item(1).Range
+        $paraText = $paraRange.Text
+        $detectedMode = $fillMode
+
+        if ($fillMode -eq "auto") {
+            if ($paraText -match '[\{\【\[]' + [regex]::Escape($p.keyword) + '[\}\】\]]') {
+                $detectedMode = "placeholder"
+            }
+            elseif ($paraText -match [regex]::Escape($p.keyword) + '\s*[：:]\s*_+') {
+                $detectedMode = "underline"
+            }
+            elseif ($paraText -match [regex]::Escape($p.keyword) + '\s*[：:]') {
+                $detectedMode = "afterColon"
+            }
+            else {
+                $afterKeyword = $paraText.Substring([Math]::Min($paraText.IndexOf($p.keyword) + $p.keyword.Length, $paraText.Length))
+                $afterKeyword = $afterKeyword.TrimStart().TrimEnd("`r`n", "`r", "`n").TrimEnd()
+                if ($afterKeyword.Length -eq 0 -or $afterKeyword -match '^[\s\r\n]*$') {
+                    $detectedMode = "afterLabel"
+                } else {
+                    $detectedMode = "afterColon"
+                }
+            }
+        }
+
+        $fillResult = ""
+        switch ($detectedMode) {
+            "placeholder" {
+                $fullPlaceholder = ""
+                if ($paraText -match '([\{\【\[])' + [regex]::Escape($p.keyword) + '([\}\】\]])') {
+                    $fullPlaceholder = $Matches[0]
+                } else {
+                    $fullPlaceholder = $p.keyword
+                }
+                $replaceRange = $doc.Content.Duplicate
+                $replaceRange.Find.ClearFormatting()
+                $replaceRange.Find.Text = $fullPlaceholder
+                $found2 = $replaceRange.Find.Execute($fullPlaceholder, $false, $false, $false, $false, $false, $true, 1, $false, $p.value, 1)
+                if ($found2) { $fillResult = "Replaced placeholder '$fullPlaceholder' with '$($p.value)'" }
+                else { $fillResult = "Failed to replace placeholder" }
+            }
+            "underline" {
+                $keywordEndPos = $matchEnd
+                $fillDone = $false
+                for ($ri = 1; $ri -le $paraRange.Words.Count; $ri++) {
+                    $wordObj = $paraRange.Words.Item($ri)
+                    if ($wordObj.Start -gt $keywordEndPos -and $wordObj.Font.Underline -ne 0 -and $wordObj.Text -match '_+') {
+                        $wordObj.Text = $p.value
+                        $wordObj.Font.Underline = 1
+                        $fillDone = $true
+                        $fillResult = "Filled underlined field after '$($p.keyword)' with '$($p.value)'"
+                        break
+                    }
+                }
+                if (-not $fillDone) {
+                    $underscorePattern = "_+"
+                    $afterKeyRange = $doc.Range($keywordEndPos, $paraRange.End)
+                    $afterKeyRange.Find.ClearFormatting()
+                    $afterKeyRange.Find.Text = $underscorePattern
+                    $afterKeyRange.Find.MatchWildcards = $true
+                    $foundUl = $afterKeyRange.Find.Execute($underscorePattern, $false, $false, $false, $false, $false, $true, 1, $false, $p.value, 1)
+                    if ($foundUl) {
+                        $fillResult = "Filled underline after '$($p.keyword)' with '$($p.value)'"
+                    } else {
+                        $insertRange = $doc.Range($keywordEndPos, $keywordEndPos)
+                        $insertRange.InsertAfter($p.value)
+                        $fillResult = "Inserted '$($p.value)' after keyword '$($p.keyword)' (no underline found)"
+                    }
+                }
+            }
+            "afterColon" {
+                $afterKeyRange = $doc.Range($matchEnd, $paraRange.End)
+                $afterKeyText = $afterKeyRange.Text
+                $colonOffset = $afterKeyText.IndexOfAny([char[]]@('：', ':'))
+                if ($colonOffset -ge 0) {
+                    $insertPos = $matchEnd + $colonOffset + 1
+                    $afterColonRange = $doc.Range($insertPos, $paraRange.End - 1)
+                    $afterColonText = $afterColonRange.Text.TrimStart().TrimEnd("`r`n", "`r", "`n").TrimEnd()
+                    if ($afterColonText.Length -gt 0 -and $afterColonText -notmatch '^[\s\r\n_　]+$') {
+                        $afterColonRange.Text = $p.value
+                        $fillResult = "Replaced content after colon with '$($p.value)'"
+                    } else {
+                        $insertRange = $doc.Range($insertPos, $insertPos)
+                        $insertRange.InsertAfter($p.value)
+                        $fillResult = "Inserted '$($p.value)' after colon following '$($p.keyword)'"
+                    }
+                } else {
+                    $insertRange = $doc.Range($matchEnd, $matchEnd)
+                    $insertRange.InsertAfter("：" + $p.value)
+                    $fillResult = "No colon found, inserted '：$($p.value)' after '$($p.keyword)'"
+                }
+            }
+            "afterLabel" {
+                $insertRange = $doc.Range($matchEnd, $matchEnd)
+                $insertRange.InsertAfter($p.value)
+                $fillResult = "Inserted '$($p.value)' after label '$($p.keyword)'"
+            }
+            default {
+                $insertRange = $doc.Range($matchEnd, $matchEnd)
+                $insertRange.InsertAfter($p.value)
+                $fillResult = "Inserted '$($p.value)' after '$($p.keyword)' (default mode)"
+            }
+        }
+        Output-Json @{ success = $true; data = @{ keyword = $p.keyword; value = $p.value; fillMode = $detectedMode; result = $fillResult } }
+    }
+
+    "replaceBookmarkContent" {
+        $word = Get-WpsWord
+        if ($null -eq $word) { Output-Json @{ success = $false; error = "WPS Word not running" }; exit }
+        $doc = $word.ActiveDocument
+        if ($null -eq $doc) { Output-Json @{ success = $false; error = "No active document" }; exit }
+        if (-not $p.name) { Output-Json @{ success = $false; error = "name required" }; exit }
+        if ($null -eq $p.text) { Output-Json @{ success = $false; error = "text required" }; exit }
+        try {
+            $bm = $doc.Bookmarks.Item($p.name)
+            $bmStart = $bm.Start
+            $bmRange = $bm.Range
+            $bmRange.Text = $p.text
+            $newEnd = $bmStart + $p.text.Length
+            $newRange = $doc.Range($bmStart, $newEnd)
+            $doc.Bookmarks.Add($p.name, $newRange) | Out-Null
+            Output-Json @{ success = $true; data = @{ name = $p.name; text = $p.text; start = $bmStart; end = $newEnd } }
+        } catch {
+            Output-Json @{ success = $false; error = "Bookmark '$($p.name)' not found or failed to replace: $($_.Exception.Message)" }
+        }
+    }
+
     "addComment" {
         $word = Get-WpsWord
         if ($null -eq $word) { Output-Json @{ success = $false; error = "WPS Word not running" }; exit }

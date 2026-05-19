@@ -64,6 +64,14 @@ export {
   insertCommentHandler,
   setTextColorDefinition,
   setTextColorHandler,
+  getParagraphsDefinition,
+  getParagraphsHandler,
+  findInDocumentDefinition,
+  findInDocumentHandler,
+  smartFillFieldDefinition,
+  smartFillFieldHandler,
+  replaceBookmarkContentDefinition,
+  replaceBookmarkContentHandler,
 } from './content';
 
 export {
