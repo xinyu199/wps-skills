@@ -142,6 +142,7 @@ mkdir -p ~/.local/share/Kingsoft/wps/jsaddons
 cp -R wps-claude-assistant ~/.local/share/Kingsoft/wps/jsaddons/claude-assistant_
 
 # 创建 publish.xml
+# 注：enable="enable_dev" 为开发模式（默认）；若加载失败可改为 enable="true"（发布模式）
 cat > ~/.local/share/Kingsoft/wps/jsaddons/publish.xml << 'EOF'
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <jsplugins>
@@ -184,6 +185,17 @@ grep "claude-assistant" ~/.local/share/Kingsoft/wps/jsaddons/publish.xml
 1. **重启 Claude Code**（必须！）
 2. 重启 WPS Office
 3. 打开任意文档，查看 "Claude助手" 选项卡
+
+### ⚠️ Linux 启动顺序（重要）
+
+Issue #17 反馈：在 Kylin Linux 等发行版上，若 WPS 已运行后再启动 Claude Code（MCP Server），WPS 进程可能异常退出。
+
+**正确启动顺序**：
+1. 先启动 **Claude Code**（含 MCP Server 初始化）
+2. 再启动 **WPS Office**（加载项 HTTP 轮询会找到已就绪的 58891 端口）
+3. 使用 WPS MCP 工具
+
+若 WPS 已在运行，建议先 `pkill -9 wps && pkill -9 wpp && pkill -9 et`，再按上述顺序重启。
 
 ### Linux 关键路径参考
 

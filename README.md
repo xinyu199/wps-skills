@@ -67,7 +67,15 @@ cd ..
 }
 ```
 
-**Augment / 其他MCP兼容IDE** — 参考各IDE的MCP Server配置文档，使用相同的command和args。
+**OpenAI Codex CLI** — 写入 `~/.codex/config.toml`：
+```toml
+[mcp_servers.wps-office]
+command = "node"
+args = ["/你的路径/wps-skills/wps-office-mcp/dist/index.js"]
+```
+或命令行注册：`codex mcp add wps-office -- node /你的路径/wps-skills/wps-office-mcp/dist/index.js`
+
+**Augment / 其他MCP兼容IDE** — 参考各IDE的MCP Server配置文档，使用相同的command和args。本项目 MCP Server 为标准 stdio 实现（spec 2025-11-25），与所有 MCP 一等客户端（Claude Code / Cursor / Codex CLI / GitHub Copilot CLI / Windsurf 等）兼容。
 
 ### 步骤4: 安装WPS加载项
 
