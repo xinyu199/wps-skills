@@ -28,8 +28,11 @@ import { errorUtils } from '../utils/error';
 import { macPollServer } from './mac-poll-server';
 
 // 平台判断
-const IS_MAC = os.platform() === 'darwin';
-// const IS_WINDOWS = os.platform() === 'win32';  // 暂时不用，保留备用
+const PLATFORM = os.platform();
+const IS_MAC = PLATFORM === 'darwin';
+const IS_LINUX = PLATFORM === 'linux';
+// Mac 和 Linux 均通过反向轮询（wps-claude-assistant 加载项 HTTP 轮询模式），仅 Windows 走 PowerShell COM
+const USE_POLL = IS_MAC || IS_LINUX;
 
 // PowerShell脚本路径 (Windows)
 const PS_SCRIPT_PATH = path.join(__dirname, '../../scripts/wps-com.ps1');
@@ -138,7 +141,7 @@ async function execPowerShell(action: string, params: Record<string, unknown> = 
  * Windows: PowerShell调用COM接口
  */
 async function execWpsAction(action: string, params: Record<string, unknown> = {}): Promise<unknown> {
-  if (IS_MAC) {
+  if (USE_POLL) {
     return execMacPoll(action, params);
   } else {
     return execPowerShell(action, params);
@@ -155,8 +158,8 @@ export class WpsClient {
 
   constructor(_config?: Partial<WpsEndpointConfig>) {
     this.status = { connected: false };
-    const method = IS_MAC ? 'HTTP (Mac Addon)' : 'PowerShell COM';
-    log.info('WPS Client initialized', { method, platform: os.platform() });
+    const method = USE_POLL ? `HTTP Poll (${PLATFORM})` : 'PowerShell COM';
+    log.info('WPS Client initialized', { method, platform: PLATFORM });
   }
 
   /**
