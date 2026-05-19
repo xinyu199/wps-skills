@@ -91,11 +91,12 @@ async function execPowerShell(action: string, params: Record<string, unknown> = 
     let stderr = '';
     let killed = false;
 
-    // 超时保护：防止PowerShell进程挂起
+    // 超时保护：防止PowerShell进程挂起，超时时主动 SIGTERM 并记录 PID
     const timeoutHandle = setTimeout(() => {
       killed = true;
+      log.warn('PowerShell timeout, killing process', { pid: ps.pid, action, timeoutMs: PS_TIMEOUT });
       ps.kill('SIGTERM');
-      reject(new Error(`PowerShell 执行超时（${PS_TIMEOUT}ms）: ${action}`));
+      reject(new Error(`PowerShell 执行超时（${PS_TIMEOUT}ms）: ${action} (PID: ${ps.pid})`));
     }, PS_TIMEOUT);
 
     ps.stdout.on('data', (data) => {
@@ -111,9 +112,14 @@ async function execPowerShell(action: string, params: Record<string, unknown> = 
       if (killed) return; // 已超时处理，忽略后续事件
 
       if (code !== 0) {
-        const errMsg = stderr || `PowerShell 非零退出码: ${code}`;
-        log.error('PowerShell error', { stderr, code, action });
-        reject(new Error(errMsg));
+        // 非零退出码：分别处理 stderr 有内容 / 为空两种路径，避免空 stderr 误入 JSON.parse
+        if (stderr) {
+          log.error('PowerShell error', { stderr, code, pid: ps.pid, action });
+          reject(new Error(stderr));
+        } else {
+          log.error('PowerShell exited with non-zero code', { code, stdout: stdout.substring(0, 200), pid: ps.pid, action });
+          reject(new Error(`PowerShell 退出码 ${code}: ${stdout.substring(0, 200) || '(无输出)'}`));
+        }
         return;
       }
 
@@ -121,7 +127,7 @@ async function execPowerShell(action: string, params: Record<string, unknown> = 
         const result = JSON.parse(stdout.trim());
         resolve(result);
       } catch (_e) {
-        log.error('Failed to parse PowerShell output', { stdout, action });
+        log.error('Failed to parse PowerShell output', { stdout: stdout.substring(0, 200), pid: ps.pid, action });
         reject(new Error(`PowerShell 输出解析失败（非有效JSON）: ${stdout.substring(0, 200)}`));
       }
     });
@@ -129,7 +135,7 @@ async function execPowerShell(action: string, params: Record<string, unknown> = 
     ps.on('error', (err) => {
       clearTimeout(timeoutHandle);
       if (killed) return;
-      log.error('PowerShell spawn error', { error: err.message, action });
+      log.error('PowerShell spawn error', { error: err.message, pid: ps.pid, action });
       reject(new Error(`无法启动 PowerShell 进程: ${err.message}`));
     });
   });
