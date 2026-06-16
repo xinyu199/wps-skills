@@ -51,7 +51,7 @@ check_prerequisites() {
     echo -e "${GREEN}✓ 操作系统: macOS $(sw_vers -productVersion)${NC}"
 
     # 检查 WPS Office
-    if [ ! -d "/Applications/wpsoffice.app" ]; then
+    if [ ! -d "/Applications/wpsoffice.app" ] && [ ! -d "/Applications/WPS Office.app" ]; then
         echo -e "${RED}❌ 错误: 未检测到 WPS Office${NC}"
         echo "请先安装 WPS Office for Mac: https://www.wps.cn/product/wpsmac"
         exit 1
