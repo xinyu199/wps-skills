@@ -22,7 +22,7 @@ import {
   ToolCategory,
   RegisteredTool,
 } from '../../types/tools';
-import { wpsClient } from '../../client/wps-client';
+import { wpsClient, setPptTarget } from '../../client/wps-client';
 import { WpsAppType } from '../../types/wps';
 
 /**
@@ -629,6 +629,177 @@ export const insertSlideImageHandler: ToolHandler = async (
 };
 
 /**
+ * 从其它演示文稿导入整页幻灯片（跨PPT整合，保留来源格式）
+ */
+export const insertSlidesFromFileDefinition: ToolDefinition = {
+  name: 'wps_ppt_insert_slides_from_file',
+  description: `从另一个 PPT 文件把整页幻灯片插入到【当前活动演示文稿】，并保留来源幻灯片的原始格式（字体/配色/版式/图片）。用于把多个 PPT 整合成一个。
+
+使用场景：
+- "把可行性报告.pptx 的第3到5页插到当前PPT第10页后面"
+- "整合多个PPT：把另一个演示文稿的所有幻灯片合并进来"
+- "从某个PPT复制整页过来，保持原样式"
+
+说明：
+- 先用 wps_ppt_switch_presentation 切换到【目标/接收页】演示文稿，再调用本工具
+- afterIndex 表示插入到第几页之后（0=插到最前，不填=追加到末尾）
+- slideStart/slideEnd 指定只导入来源文件的某段页码范围，不填则导入全部
+- 底层调用 WPS COM Slides.InsertFromFile，原样保留来源格式，避免AI重排导致的版式失真`,
+  category: ToolCategory.PRESENTATION,
+  inputSchema: {
+    type: 'object',
+    properties: {
+      filePath: {
+        type: 'string',
+        description: '来源 PPT 文件的完整路径',
+      },
+      afterIndex: {
+        type: 'number',
+        description: '插入到当前演示文稿第几页之后（0=最前，不填=末尾追加）',
+      },
+      slideStart: {
+        type: 'number',
+        description: '来源文件起始页码（从1开始，可选）',
+      },
+      slideEnd: {
+        type: 'number',
+        description: '来源文件结束页码（可选，与slideStart配合）',
+      },
+    },
+    required: ['filePath'],
+  },
+};
+
+export const insertSlidesFromFileHandler: ToolHandler = async (
+  args: Record<string, unknown>
+): Promise<ToolCallResult> => {
+  const { filePath, afterIndex, slideStart, slideEnd } = args as {
+    filePath: string;
+    afterIndex?: number;
+    slideStart?: number;
+    slideEnd?: number;
+  };
+
+  try {
+    const response = await wpsClient.executeMethod<{
+      success: boolean;
+      message: string;
+      inserted: number;
+      afterIndex: number;
+      totalSlides: number;
+      source: string;
+    }>(
+      'insertSlidesFromFile',
+      { filePath, path: filePath, afterIndex, slideStart, slideEnd },
+      WpsAppType.PRESENTATION
+    );
+
+    if (response.success && response.data) {
+      return {
+        id: uuidv4(),
+        success: true,
+        content: [
+          {
+            type: 'text',
+            text: `已从来源文件导入 ${response.data.inserted} 页幻灯片（保留来源格式）！\n来源: ${filePath}\n插入位置: 第 ${response.data.afterIndex} 页之后\n当前演示文稿总页数: ${response.data.totalSlides}`,
+          },
+        ],
+      };
+    } else {
+      return {
+        id: uuidv4(),
+        success: false,
+        content: [{ type: 'text', text: `导入幻灯片失败: ${response.error}` }],
+        error: response.error,
+      };
+    }
+  } catch (error) {
+    const errMsg = error instanceof Error ? error.message : String(error);
+    return {
+      id: uuidv4(),
+      success: false,
+      content: [{ type: 'text', text: `导入幻灯片出错: ${errMsg}` }],
+      error: errMsg,
+    };
+  }
+};
+
+/**
+ * 锁定后续所有 PPT 操作的目标演示文稿（避免多文稿打开时活动文稿漂移改错文件）
+ */
+export const setActiveTargetDefinition: ToolDefinition = {
+  name: 'wps_ppt_set_active_target',
+  description: `锁定后续所有 PPT 操作的【目标演示文稿】（按文件名）。锁定后，本服务器会给所有演示类调用自动注入该文稿名，底层精确定位，**彻底避免同时打开多个 PPT 时"活动文稿漂移"导致改错文件**。
+
+使用场景：
+- 批量改某个 PPT 前先锁定："把目标锁定为 关节模组申报PPT-生成版.pptx"
+- 传 clear=true 或留空 name 取消锁定，恢复使用当前活动文稿
+
+强烈建议：在对一个特定 PPT 做成批增改前，先调用本工具锁定它。`,
+  category: ToolCategory.PRESENTATION,
+  inputSchema: {
+    type: 'object',
+    properties: {
+      name: {
+        type: 'string',
+        description: '目标演示文稿文件名（如 关节模组申报PPT-生成版.pptx）；留空或 clear=true 则取消锁定',
+      },
+      clear: {
+        type: 'boolean',
+        description: '为 true 时清除锁定，恢复使用当前活动文稿',
+      },
+    },
+    required: [],
+  },
+};
+
+export const setActiveTargetHandler: ToolHandler = async (
+  args: Record<string, unknown>
+): Promise<ToolCallResult> => {
+  const { name, clear } = args as { name?: string; clear?: boolean };
+
+  if (clear || !name) {
+    setPptTarget(undefined);
+    return {
+      id: uuidv4(),
+      success: true,
+      content: [{ type: 'text', text: '已取消目标文稿锁定，后续 PPT 操作使用当前活动文稿。' }],
+    };
+  }
+
+  try {
+    const resp = await wpsClient.executeMethod<{ presentations: Array<{ name: string }> }>(
+      'getOpenPresentations',
+      {}
+    );
+    const names = resp.success && resp.data ? resp.data.presentations.map((x) => x.name) : [];
+    const matched = names.includes(name);
+    setPptTarget(name);
+    const warn = matched
+      ? ''
+      : `\n⚠️ 当前打开的文稿中没有完全同名的「${name}」。已打开：${names.join(' / ') || '(无)'}。若名称不符，后续操作会报"未找到目标文稿"。`;
+    return {
+      id: uuidv4(),
+      success: true,
+      content: [
+        {
+          type: 'text',
+          text: `已锁定目标演示文稿：${name}\n后续所有 PPT 操作都会定位到该文稿（不受活动窗口切换影响）。${warn}`,
+        },
+      ],
+    };
+  } catch (error) {
+    const errMsg = error instanceof Error ? error.message : String(error);
+    setPptTarget(name);
+    return {
+      id: uuidv4(),
+      success: true,
+      content: [{ type: 'text', text: `已锁定目标演示文稿：${name}（打开列表校验失败：${errMsg}）` }],
+    };
+  }
+};
+
+/**
  * 导出所有演示文稿管理相关的Tools
  */
 export const presentationTools: RegisteredTool[] = [
@@ -640,6 +811,8 @@ export const presentationTools: RegisteredTool[] = [
   { definition: setSlideThemeDefinition, handler: setSlideThemeHandler },
   { definition: copySlideDefinition, handler: copySlideHandler },
   { definition: insertSlideImageDefinition, handler: insertSlideImageHandler },
+  { definition: insertSlidesFromFileDefinition, handler: insertSlidesFromFileHandler },
+  { definition: setActiveTargetDefinition, handler: setActiveTargetHandler },
 ];
 
 export default presentationTools;

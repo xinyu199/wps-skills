@@ -66,6 +66,17 @@ async function execMacPoll(action: string, params: Record<string, unknown> = {})
 // PowerShell 默认超时（毫秒）
 const PS_TIMEOUT = 30000;
 
+// ==================== PPT 目标文稿锁定（避免多文稿打开时 ActivePresentation 漂移）====================
+// 通过 wps_ppt_set_active_target 设置后，所有 PRESENTATION 类调用（executeMethod 带 WpsAppType.PRESENTATION）
+// 自动注入 presentationName，由 wps-com.ps1 的 Get-TargetPres 精确定位目标文稿；单次调用显式传 presentationName 可覆盖。
+let pptTargetName: string | undefined;
+export function setPptTarget(name?: string): void {
+  pptTargetName = name && name.trim() ? name.trim() : undefined;
+}
+export function getPptTarget(): string | undefined {
+  return pptTargetName;
+}
+
 /**
  * 执行PowerShell命令 (Windows)
  */
@@ -320,9 +331,14 @@ export class WpsClient {
   async executeMethod<T = unknown>(
     method: string,
     params?: Record<string, unknown>,
-    _appType?: WpsAppType
+    appType?: WpsAppType
   ): Promise<WpsApiResponse<T>> {
-    return this.invokeAction<T>(method, params);
+    let finalParams: Record<string, unknown> = params || {};
+    // 锁定目标文稿后，为演示类调用自动注入 presentationName（已显式传入则不覆盖）
+    if (appType === WpsAppType.PRESENTATION && pptTargetName && finalParams.presentationName === undefined) {
+      finalParams = { ...finalParams, presentationName: pptTargetName };
+    }
+    return this.invokeAction<T>(method, finalParams);
   }
 
   async openFile(filePath: string, _appType?: WpsAppType): Promise<boolean> {
