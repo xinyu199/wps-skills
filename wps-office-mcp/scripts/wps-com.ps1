@@ -27,7 +27,15 @@ function Get-WpsWord {
 
 function Get-WpsPpt {
     try { return [System.Runtime.InteropServices.Marshal]::GetActiveObject('Kwpp.Application') }
-    catch { return $null }
+    catch {
+        # 活动对象取不到(演示未运行 / ROT 注册过期)时，用 CreateObject 拉起/附着 WPS 演示，
+        # 使 open/create 等操作在无打开窗口时也能工作(GetActiveObject 仅能附着前台实例，无法冷启动)。
+        try {
+            $app = New-Object -ComObject Kwpp.Application
+            try { $app.Visible = $true } catch {}
+            return $app
+        } catch { return $null }
+    }
 }
 
 # 解析目标演示文稿：优先按 presentationName 精确定位（避免多文稿打开时 ActivePresentation 漂移），
@@ -38,6 +46,84 @@ function Get-TargetPres($ppt, $p) {
         try { return $ppt.Presentations.Item([string]$p.presentationName) } catch { return $null }
     }
     return $ppt.ActivePresentation
+}
+
+# 在一个 TextFrame 内查找替换：先精确匹配(保留原换行)；多行 find 未命中时，把 \r\n/\r/\v 与 \n 规范化后再匹配并写回。返回是否发生替换。
+function Replace-FrameText($frame, [string]$findText, [string]$replaceText) {
+    try {
+        if ($null -eq $frame -or -not $frame.HasText) { return $false }
+        $text = $frame.TextRange.Text
+        if ($null -eq $text) { return $false }
+        if ($text.Contains($findText)) {
+            $frame.TextRange.Text = $text.Replace($findText, $replaceText)
+            return $true
+        }
+        if ($findText.Contains("`n")) {
+            $nf = ((($findText -replace "`r`n", "`n") -replace "`r", "`n") -replace "`v", "`n")
+            $nt = ((($text -replace "`r`n", "`n") -replace "`r", "`n") -replace "`v", "`n")
+            if ($nt.Contains($nf)) {
+                $frame.TextRange.Text = $nt.Replace($nf, $replaceText)
+                return $true
+            }
+            # 兜底1：去掉所有换行后，若 find 恰为整块文本(PDF抽取的"幻影换行")，整体替换该形状
+            $sf = ($findText -replace "[`r`n`v]", "")
+            $st = ($text -replace "[`r`n`v]", "")
+            if ($sf.Length -gt 0 -and $st -eq $sf) {
+                $frame.TextRange.Text = $replaceText
+                return $true
+            }
+            # 兜底2：去换行做子串匹配(find 是大形状里的一段且含幻影换行)，命中后用 stripped→原文 索引映射在原位替换
+            if ($sf.Length -gt 0) {
+                $origChars = $text.ToCharArray()
+                $sb = New-Object System.Text.StringBuilder
+                $map = New-Object System.Collections.Generic.List[int]
+                for ($k = 0; $k -lt $origChars.Length; $k++) {
+                    $ch = $origChars[$k]
+                    if ($ch -ne [char]13 -and $ch -ne [char]10 -and $ch -ne [char]11) {
+                        [void]$sb.Append($ch); $map.Add($k)
+                    }
+                }
+                $idx = $sb.ToString().IndexOf($sf)
+                if ($idx -ge 0) {
+                    $startOrig = $map[$idx]
+                    $endOrig = $map[$idx + $sf.Length - 1]
+                    $before = $text.Substring(0, $startOrig)
+                    $after = $text.Substring($endOrig + 1)
+                    $frame.TextRange.Text = $before + $replaceText + $after
+                    return $true
+                }
+            }
+        }
+        return $false
+    } catch { return $false }
+}
+
+# 递归处理一个形状(及其组合/表格内的所有子形状)的文本替换，返回命中次数。
+# 修复：replacePptText 原来只扫顶层 Shapes，组合(Group)内文字(如封面/立项页的旧项目名)替换不到。
+function Replace-InShapeTree($shape, [string]$findText, [string]$replaceText) {
+    $cnt = 0
+    try {
+        $isGroup = $false
+        try { if ($shape.Type -eq 6) { $isGroup = $true } } catch {}
+        if ($isGroup) {
+            for ($gi = 1; $gi -le $shape.GroupItems.Count; $gi++) {
+                $cnt += Replace-InShapeTree $shape.GroupItems.Item($gi) $findText $replaceText
+            }
+        } else {
+            try { if ($shape.HasTextFrame) { if (Replace-FrameText $shape.TextFrame $findText $replaceText) { $cnt++ } } } catch {}
+            try {
+                if ($shape.HasTable) {
+                    $tbl = $shape.Table
+                    for ($rr = 1; $rr -le $tbl.Rows.Count; $rr++) {
+                        for ($cc = 1; $cc -le $tbl.Columns.Count; $cc++) {
+                            try { if (Replace-FrameText $tbl.Cell($rr, $cc).Shape.TextFrame $findText $replaceText) { $cnt++ } } catch {}
+                        }
+                    }
+                }
+            } catch {}
+        }
+    } catch {}
+    return $cnt
 }
 
 function Output-Json($obj) {
@@ -2548,9 +2634,30 @@ switch ($Action) {
         $shapes = @()
         for ($i = 1; $i -le $slide.Shapes.Count; $i++) {
             $shape = $slide.Shapes.Item($i)
-            $shapes += @{ name = $shape.Name; type = $shape.Type; hasText = if ($shape.HasTextFrame) { $true } else { $false } }
+            $txt = ""
+            try { if ($shape.HasTextFrame -and $shape.TextFrame.HasText) { $txt = $shape.TextFrame.TextRange.Text } } catch {}
+            try {
+                if ($shape.HasTable -and [string]::IsNullOrEmpty($txt)) {
+                    $tbl = $shape.Table; $rws = @()
+                    for ($rr = 1; $rr -le $tbl.Rows.Count; $rr++) {
+                        $cs = @()
+                        for ($cc = 1; $cc -le $tbl.Columns.Count; $cc++) {
+                            $cv = ""
+                            try { $cv = $tbl.Cell($rr, $cc).Shape.TextFrame.TextRange.Text } catch {}
+                            $cs += $cv
+                        }
+                        $rws += ($cs -join "|")
+                    }
+                    $txt = "[表格] " + ($rws -join " ;; ")
+                }
+            } catch {}
+            $txt = ($txt -replace "[`r`n`v]", " ")
+            if ($txt.Length -gt 90) { $txt = $txt.Substring(0, 90) + "…" }
+            $hasTxt = $false
+            if ($shape.HasTextFrame) { $hasTxt = $true }
+            $shapes += @{ name = $shape.Name; type = "$($shape.Type)"; hasText = $hasTxt; text = $txt }
         }
-        Output-Json @{ success = $true; data = @{ index = $index; shapeCount = $slide.Shapes.Count; shapes = $shapes; layout = $slide.Layout } }
+        Output-Json @{ success = $true; data = @{ index = $index; slideIndex = $index; shapeCount = $slide.Shapes.Count; shapesCount = $slide.Shapes.Count; shapes = $shapes; layout = "$($slide.Layout)" } }
     }
 
     "switchSlide" {
@@ -3026,10 +3133,29 @@ switch ($Action) {
         $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
-        $shape = $slide.Shapes.Item($(if ($p.tableName) { $p.tableName } else { $p.tableIndex }))
-        $cell = $shape.Table.Cell($p.row, $p.col)
-        $value = $cell.Shape.TextFrame.TextRange.Text
-        Output-Json @{ success = $true; data = @{ row = $p.row; col = $p.col; value = $value } }
+        $shape = $null
+        $tableCount = 0
+        $targetIndex = if ($p.tableIndex) { $p.tableIndex } else { 1 }
+        if ($p.tableName) {
+            $shape = $slide.Shapes.Item($p.tableName)
+        } else {
+            for ($i = 1; $i -le $slide.Shapes.Count; $i++) {
+                $s = $slide.Shapes.Item($i)
+                if ($s.HasTable) {
+                    $tableCount++
+                    if ($tableCount -eq $targetIndex) { $shape = $s; break }
+                }
+            }
+        }
+        if ($null -eq $shape -or -not $shape.HasTable) { Output-Json @{ success = $false; error = "Table not found" }; exit }
+        $table = $shape.Table
+        $rowCount = $table.Rows.Count
+        $colCount = $table.Columns.Count
+        $value = $null
+        if ($null -ne $p.row -and $null -ne $p.col) {
+            try { $value = $table.Cell($p.row, $p.col).Shape.TextFrame.TextRange.Text } catch { $value = $null }
+        }
+        Output-Json @{ success = $true; data = @{ row = $p.row; col = $p.col; value = $value; rowCount = $rowCount; colCount = $colCount } }
     }
 
     "setPptTableStyle" {
@@ -4553,15 +4679,8 @@ switch ($Action) {
             $slide = $pres.Slides.Item($i)
             for ($j = 1; $j -le $slide.Shapes.Count; $j++) {
                 $shape = $slide.Shapes.Item($j)
-                try {
-                    if ($shape.HasTextFrame -and $shape.TextFrame.HasText) {
-                        $text = $shape.TextFrame.TextRange.Text
-                        if ($text -and $text.Contains($findText)) {
-                            $shape.TextFrame.TextRange.Text = $text.Replace($findText, $replaceText)
-                            $count++
-                        }
-                    }
-                } catch {}
+                # 递归处理：文本框 + 表格单元格 + 组合(Group)内所有子形状
+                $count += Replace-InShapeTree $shape $findText $replaceText
             }
         }
         Output-Json @{ success = $true; data = @{ findText = $findText; replaceText = $replaceText; count = $count } }
