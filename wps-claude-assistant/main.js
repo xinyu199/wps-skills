@@ -1182,6 +1182,9 @@ function handleOpenDocument(params) {
     try {
         if (!params.path) return { success: false, error: '请提供文档路径' };
         var doc = Application.Documents.Open(params.path);
+        if (!doc) {
+            return { success: false, error: '无法打开文档：文件可能不存在、格式不支持或路径无效。旧版 .doc 文件请先在 WPS 中手动打开或另存为 .docx。' };
+        }
         return { success: true, data: { name: doc.Name, path: doc.FullName, paragraphs: doc.Paragraphs.Count } };
     } catch (e) {
         return { success: false, error: e.message };
