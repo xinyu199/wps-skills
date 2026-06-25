@@ -438,6 +438,100 @@ export const exportSlideAsImageHandler: ToolHandler = async (
   }
 };
 
+// ==================== 5. 原位替换图片（换图不动版式） ====================
+
+export const replacePptImageDefinition: ToolDefinition = {
+  name: 'wps_ppt_replace_ppt_image',
+  description: `原位替换幻灯片中的某张图片：保留原图的位置、尺寸、旋转角度，删除旧图后在同一矩形内插入新图。用于在保持版式不变的前提下把模板里的旧图换成自己的图。
+
+使用场景：
+- "把第5页的第2个形状（图片）换成 D:/figs/图15.png，位置大小不变"
+- "替换封面主视觉图，但保持原来的排版"
+- "把这页的配图换掉，别动版式"
+
+说明：
+- 先用 wps_ppt_get_shapes 查到目标图片的形状索引(shapeIndex)
+- 新图会被拉伸/适配到旧图原有的位置与尺寸，从而不破坏版式`,
+  category: ToolCategory.PRESENTATION,
+  inputSchema: {
+    type: 'object',
+    properties: {
+      slideIndex: {
+        type: 'number',
+        description: '幻灯片页码（从1开始）',
+      },
+      shapeIndex: {
+        type: 'number',
+        description: '要替换的图片形状索引（从1开始，通过 get_shapes 获取）',
+      },
+      name: {
+        type: 'string',
+        description: '要替换的图片形状名称（与 shapeIndex 二选一）',
+      },
+      filePath: {
+        type: 'string',
+        description: '新图片文件的完整路径',
+      },
+    },
+    required: ['slideIndex', 'filePath'],
+  },
+};
+
+export const replacePptImageHandler: ToolHandler = async (
+  args: Record<string, unknown>
+): Promise<ToolCallResult> => {
+  const { slideIndex, shapeIndex, name, filePath } = args as {
+    slideIndex: number;
+    shapeIndex?: number;
+    name?: string;
+    filePath: string;
+  };
+
+  try {
+    const response = await wpsClient.executeMethod<{
+      success: boolean;
+      message: string;
+      name: string;
+      left: number;
+      top: number;
+      width: number;
+      height: number;
+    }>(
+      'replacePptImage',
+      { slideIndex, shapeIndex, name, filePath, path: filePath, imagePath: filePath },
+      WpsAppType.PRESENTATION
+    );
+
+    if (response.success && response.data) {
+      return {
+        id: uuidv4(),
+        success: true,
+        content: [
+          {
+            type: 'text',
+            text: `图片已原位替换（位置尺寸不变）！\n幻灯片: 第 ${slideIndex} 页\n新图: ${filePath}\n位置: (${Math.round(response.data.left)}, ${Math.round(response.data.top)})  尺寸: ${Math.round(response.data.width)} x ${Math.round(response.data.height)}`,
+          },
+        ],
+      };
+    } else {
+      return {
+        id: uuidv4(),
+        success: false,
+        content: [{ type: 'text', text: `替换图片失败: ${response.error}` }],
+        error: response.error,
+      };
+    }
+  } catch (error) {
+    const errMsg = error instanceof Error ? error.message : String(error);
+    return {
+      id: uuidv4(),
+      success: false,
+      content: [{ type: 'text', text: `替换图片出错: ${errMsg}` }],
+      error: errMsg,
+    };
+  }
+};
+
 /**
  * 导出所有图片相关的Tools
  */
@@ -446,6 +540,7 @@ export const imageTools: RegisteredTool[] = [
   { definition: deletePptImageDefinition, handler: deletePptImageHandler },
   { definition: setImageStyleDefinition, handler: setImageStyleHandler },
   { definition: exportSlideAsImageDefinition, handler: exportSlideAsImageHandler },
+  { definition: replacePptImageDefinition, handler: replacePptImageHandler },
 ];
 
 export default imageTools;

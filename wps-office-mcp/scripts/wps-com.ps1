@@ -27,7 +27,103 @@ function Get-WpsWord {
 
 function Get-WpsPpt {
     try { return [System.Runtime.InteropServices.Marshal]::GetActiveObject('Kwpp.Application') }
-    catch { return $null }
+    catch {
+        # 活动对象取不到(演示未运行 / ROT 注册过期)时，用 CreateObject 拉起/附着 WPS 演示，
+        # 使 open/create 等操作在无打开窗口时也能工作(GetActiveObject 仅能附着前台实例，无法冷启动)。
+        try {
+            $app = New-Object -ComObject Kwpp.Application
+            try { $app.Visible = $true } catch {}
+            return $app
+        } catch { return $null }
+    }
+}
+
+# 解析目标演示文稿：优先按 presentationName 精确定位（避免多文稿打开时 ActivePresentation 漂移），
+# 未提供则回退到当前活动文稿；提供了但找不到则返回 $null（让调用方报明确错误，而不是误改其它文稿）。
+function Get-TargetPres($ppt, $p) {
+    if ($null -eq $ppt) { return $null }
+    if ($p.presentationName) {
+        try { return $ppt.Presentations.Item([string]$p.presentationName) } catch { return $null }
+    }
+    return $ppt.ActivePresentation
+}
+
+# 在一个 TextFrame 内查找替换：先精确匹配(保留原换行)；多行 find 未命中时，把 \r\n/\r/\v 与 \n 规范化后再匹配并写回。返回是否发生替换。
+function Replace-FrameText($frame, [string]$findText, [string]$replaceText) {
+    try {
+        if ($null -eq $frame -or -not $frame.HasText) { return $false }
+        $text = $frame.TextRange.Text
+        if ($null -eq $text) { return $false }
+        if ($text.Contains($findText)) {
+            $frame.TextRange.Text = $text.Replace($findText, $replaceText)
+            return $true
+        }
+        if ($findText.Contains("`n")) {
+            $nf = ((($findText -replace "`r`n", "`n") -replace "`r", "`n") -replace "`v", "`n")
+            $nt = ((($text -replace "`r`n", "`n") -replace "`r", "`n") -replace "`v", "`n")
+            if ($nt.Contains($nf)) {
+                $frame.TextRange.Text = $nt.Replace($nf, $replaceText)
+                return $true
+            }
+            # 兜底1：去掉所有换行后，若 find 恰为整块文本(PDF抽取的"幻影换行")，整体替换该形状
+            $sf = ($findText -replace "[`r`n`v]", "")
+            $st = ($text -replace "[`r`n`v]", "")
+            if ($sf.Length -gt 0 -and $st -eq $sf) {
+                $frame.TextRange.Text = $replaceText
+                return $true
+            }
+            # 兜底2：去换行做子串匹配(find 是大形状里的一段且含幻影换行)，命中后用 stripped→原文 索引映射在原位替换
+            if ($sf.Length -gt 0) {
+                $origChars = $text.ToCharArray()
+                $sb = New-Object System.Text.StringBuilder
+                $map = New-Object System.Collections.Generic.List[int]
+                for ($k = 0; $k -lt $origChars.Length; $k++) {
+                    $ch = $origChars[$k]
+                    if ($ch -ne [char]13 -and $ch -ne [char]10 -and $ch -ne [char]11) {
+                        [void]$sb.Append($ch); $map.Add($k)
+                    }
+                }
+                $idx = $sb.ToString().IndexOf($sf)
+                if ($idx -ge 0) {
+                    $startOrig = $map[$idx]
+                    $endOrig = $map[$idx + $sf.Length - 1]
+                    $before = $text.Substring(0, $startOrig)
+                    $after = $text.Substring($endOrig + 1)
+                    $frame.TextRange.Text = $before + $replaceText + $after
+                    return $true
+                }
+            }
+        }
+        return $false
+    } catch { return $false }
+}
+
+# 递归处理一个形状(及其组合/表格内的所有子形状)的文本替换，返回命中次数。
+# 修复：replacePptText 原来只扫顶层 Shapes，组合(Group)内文字(如封面/立项页的旧项目名)替换不到。
+function Replace-InShapeTree($shape, [string]$findText, [string]$replaceText) {
+    $cnt = 0
+    try {
+        $isGroup = $false
+        try { if ($shape.Type -eq 6) { $isGroup = $true } } catch {}
+        if ($isGroup) {
+            for ($gi = 1; $gi -le $shape.GroupItems.Count; $gi++) {
+                $cnt += Replace-InShapeTree $shape.GroupItems.Item($gi) $findText $replaceText
+            }
+        } else {
+            try { if ($shape.HasTextFrame) { if (Replace-FrameText $shape.TextFrame $findText $replaceText) { $cnt++ } } } catch {}
+            try {
+                if ($shape.HasTable) {
+                    $tbl = $shape.Table
+                    for ($rr = 1; $rr -le $tbl.Rows.Count; $rr++) {
+                        for ($cc = 1; $cc -le $tbl.Columns.Count; $cc++) {
+                            try { if (Replace-FrameText $tbl.Cell($rr, $cc).Shape.TextFrame $findText $replaceText) { $cnt++ } } catch {}
+                        }
+                    }
+                }
+            } catch {}
+        }
+    } catch {}
+    return $cnt
 }
 
 function Output-Json($obj) {
@@ -351,7 +447,7 @@ switch ($Action) {
         }
         $ppt = Get-WpsPpt
         if ($null -ne $ppt -and $null -ne $ppt.ActivePresentation) {
-            $pres = $ppt.ActivePresentation
+            $pres = Get-TargetPres $ppt $p
             $sourcePath = $pres.FullName
             $outputPath = if ($p.outputPath) { $p.outputPath } else { [System.IO.Path]::ChangeExtension($sourcePath, 'pdf') }
             $pres.SaveAs($outputPath, 32)
@@ -386,7 +482,7 @@ switch ($Action) {
         }
         $ppt = Get-WpsPpt
         if ($null -ne $ppt -and $null -ne $ppt.ActivePresentation) {
-            $pres = $ppt.ActivePresentation
+            $pres = Get-TargetPres $ppt $p
             $sourcePath = $pres.FullName
             $outputPath = if ($p.outputPath) { $p.outputPath } else { [System.IO.Path]::ChangeExtension($sourcePath, $targetFormat) }
             $format = Get-PptSaveFormat $targetFormat
@@ -2407,7 +2503,7 @@ switch ($Action) {
     "getActivePresentation" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         if ($null -eq $pres) { Output-Json @{ success = $false; error = "No active presentation" }; exit }
         $slides = @()
         for ($i = 1; $i -le $pres.Slides.Count; $i++) {
@@ -2464,7 +2560,7 @@ switch ($Action) {
     "deleteSlide" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         if ($null -eq $pres) { Output-Json @{ success = $false; error = "No active presentation" }; exit }
         $index = if ($p.index) { $p.index } else { $p.slideIndex }
         $pres.Slides.Item($index).Delete()
@@ -2474,7 +2570,7 @@ switch ($Action) {
     "duplicateSlide" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         if ($null -eq $pres) { Output-Json @{ success = $false; error = "No active presentation" }; exit }
         $index = if ($p.index) { $p.index } else { $p.slideIndex }
         if (-not $index) { $index = 1 }
@@ -2484,10 +2580,34 @@ switch ($Action) {
         Output-Json @{ success = $true; data = @{ sourceIndex = $index; newIndex = $newIndex } }
     }
 
+    "insertSlidesFromFile" {
+        # 从另一个 PPT 文件把整页幻灯片插入当前演示文稿，保留来源格式（跨PPT整合）
+        $ppt = Get-WpsPpt
+        if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
+        $pres = Get-TargetPres $ppt $p
+        if ($null -eq $pres) { Output-Json @{ success = $false; error = "No active presentation" }; exit }
+        $src = if ($p.filePath) { $p.filePath } elseif ($p.path) { $p.path } else { $null }
+        if (-not $src) { Output-Json @{ success = $false; error = "filePath required" }; exit }
+        if (-not (Test-Path $src)) { Output-Json @{ success = $false; error = "source file not found: $src" }; exit }
+        $before = $pres.Slides.Count
+        $afterIndex = if ($null -ne $p.afterIndex) { [int]$p.afterIndex } else { $before }
+        if ($afterIndex -lt 0) { $afterIndex = 0 }
+        if ($afterIndex -gt $before) { $afterIndex = $before }
+        if ($null -ne $p.slideStart -and $null -ne $p.slideEnd) {
+            [void]$pres.Slides.InsertFromFile($src, $afterIndex, [int]$p.slideStart, [int]$p.slideEnd)
+        } elseif ($null -ne $p.slideStart) {
+            [void]$pres.Slides.InsertFromFile($src, $afterIndex, [int]$p.slideStart)
+        } else {
+            [void]$pres.Slides.InsertFromFile($src, $afterIndex)
+        }
+        $after = $pres.Slides.Count
+        Output-Json @{ success = $true; data = @{ inserted = ($after - $before); afterIndex = $afterIndex; totalSlides = $after; source = $src } }
+    }
+
     "moveSlide" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         if ($null -eq $pres) { Output-Json @{ success = $false; error = "No active presentation" }; exit }
         $fromIndex = if ($p.from) { $p.from } else { $p.fromIndex }
         $toIndex = if ($p.to) { $p.to } else { $p.toIndex }
@@ -2498,7 +2618,7 @@ switch ($Action) {
     "getSlideCount" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         if ($null -eq $pres) { Output-Json @{ success = $false; error = "No active presentation" }; exit }
         Output-Json @{ success = $true; data = @{ count = $pres.Slides.Count } }
     }
@@ -2506,7 +2626,7 @@ switch ($Action) {
     "getSlideInfo" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         if ($null -eq $pres) { Output-Json @{ success = $false; error = "No active presentation" }; exit }
         $index = if ($p.index) { $p.index } else { $p.slideIndex }
         if (-not $index) { $index = 1 }
@@ -2514,15 +2634,36 @@ switch ($Action) {
         $shapes = @()
         for ($i = 1; $i -le $slide.Shapes.Count; $i++) {
             $shape = $slide.Shapes.Item($i)
-            $shapes += @{ name = $shape.Name; type = $shape.Type; hasText = if ($shape.HasTextFrame) { $true } else { $false } }
+            $txt = ""
+            try { if ($shape.HasTextFrame -and $shape.TextFrame.HasText) { $txt = $shape.TextFrame.TextRange.Text } } catch {}
+            try {
+                if ($shape.HasTable -and [string]::IsNullOrEmpty($txt)) {
+                    $tbl = $shape.Table; $rws = @()
+                    for ($rr = 1; $rr -le $tbl.Rows.Count; $rr++) {
+                        $cs = @()
+                        for ($cc = 1; $cc -le $tbl.Columns.Count; $cc++) {
+                            $cv = ""
+                            try { $cv = $tbl.Cell($rr, $cc).Shape.TextFrame.TextRange.Text } catch {}
+                            $cs += $cv
+                        }
+                        $rws += ($cs -join "|")
+                    }
+                    $txt = "[表格] " + ($rws -join " ;; ")
+                }
+            } catch {}
+            $txt = ($txt -replace "[`r`n`v]", " ")
+            if ($txt.Length -gt 90) { $txt = $txt.Substring(0, 90) + "…" }
+            $hasTxt = $false
+            if ($shape.HasTextFrame) { $hasTxt = $true }
+            $shapes += @{ name = $shape.Name; type = "$($shape.Type)"; hasText = $hasTxt; text = $txt }
         }
-        Output-Json @{ success = $true; data = @{ index = $index; shapeCount = $slide.Shapes.Count; shapes = $shapes; layout = $slide.Layout } }
+        Output-Json @{ success = $true; data = @{ index = $index; slideIndex = $index; shapeCount = $slide.Shapes.Count; shapesCount = $slide.Shapes.Count; shapes = $shapes; layout = "$($slide.Layout)" } }
     }
 
     "switchSlide" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         if ($null -eq $pres) { Output-Json @{ success = $false; error = "No active presentation" }; exit }
         $index = if ($p.index) { $p.index } else { $p.slideIndex }
         $ppt.ActiveWindow.View.GotoSlide($index)
@@ -2532,7 +2673,7 @@ switch ($Action) {
     "setSlideLayout" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         if ($null -eq $pres) { Output-Json @{ success = $false; error = "No active presentation" }; exit }
         $index = if ($p.index) { $p.index } else { $p.slideIndex }
         if (-not $index) { $index = 1 }
@@ -2546,7 +2687,7 @@ switch ($Action) {
     "getSlideNotes" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         if ($null -eq $pres) { Output-Json @{ success = $false; error = "No active presentation" }; exit }
         $index = if ($p.index) { $p.index } else { $p.slideIndex }
         if (-not $index) { $index = 1 }
@@ -2559,7 +2700,7 @@ switch ($Action) {
     "setSlideNotes" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         if ($null -eq $pres) { Output-Json @{ success = $false; error = "No active presentation" }; exit }
         $index = if ($p.index) { $p.index } else { $p.slideIndex }
         if (-not $index) { $index = 1 }
@@ -2571,7 +2712,7 @@ switch ($Action) {
     "slide.add" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $layouts = @{ title = 1; title_content = 2; blank = 12; two_column = 3; comparison = 34 }
         $layoutKey = if ($p.layout) { $p.layout } else { "title_content" }
         $layoutType = $layouts[$layoutKey]
@@ -2596,7 +2737,7 @@ switch ($Action) {
     "addSlide" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $layouts = @{ title = 1; title_content = 2; blank = 12; two_column = 3; comparison = 34 }
         $layoutKey = if ($p.layout) { $p.layout } else { "title_content" }
         $layoutType = $layouts[$layoutKey]
@@ -2621,7 +2762,7 @@ switch ($Action) {
     "addTextBox" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { $ppt.ActiveWindow.Selection.SlideRange.SlideIndex }
         $slide = $pres.Slides.Item($slideIndex)
         $left = if ($p.left) { $p.left } else { 100 }
@@ -2638,7 +2779,7 @@ switch ($Action) {
     "deleteTextBox" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $slide.Shapes.Item($(if ($p.name) { $p.name } else { $p.shapeIndex }))
@@ -2649,7 +2790,7 @@ switch ($Action) {
     "getTextBoxes" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $textBoxes = @()
@@ -2667,7 +2808,7 @@ switch ($Action) {
     "setTextBoxText" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $slide.Shapes.Item($(if ($p.name) { $p.name } else { $p.shapeIndex }))
@@ -2678,7 +2819,7 @@ switch ($Action) {
     "setTextBoxStyle" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $slide.Shapes.Item($(if ($p.name) { $p.name } else { $p.shapeIndex }))
@@ -2701,7 +2842,7 @@ switch ($Action) {
     "setSlideTitle" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         if ($slide.Shapes.HasTitle) { $slide.Shapes.Title.TextFrame.TextRange.Text = $p.title }
@@ -2711,7 +2852,7 @@ switch ($Action) {
     "getSlideTitle" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $title = ""
@@ -2722,7 +2863,7 @@ switch ($Action) {
     "setSlideSubtitle" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         for ($i = 1; $i -le $slide.Shapes.Count; $i++) {
@@ -2741,7 +2882,7 @@ switch ($Action) {
     "setSlideContent" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         for ($i = 1; $i -le $slide.Shapes.Count; $i++) {
@@ -2760,7 +2901,7 @@ switch ($Action) {
     "addShape" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shapeTypeMap = @{ rectangle = 1; oval = 9; triangle = 7; diamond = 4; pentagon = 51; hexagon = 52; arrow = 13; star = 12; heart = 21; cloud = 179 }
@@ -2782,7 +2923,7 @@ switch ($Action) {
     "deleteShape" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $slide.Shapes.Item($(if ($p.name) { $p.name } else { $p.shapeIndex }))
@@ -2793,7 +2934,7 @@ switch ($Action) {
     "getShapes" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shapes = @()
@@ -2807,7 +2948,7 @@ switch ($Action) {
     "setShapeStyle" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $slide.Shapes.Item($(if ($p.name) { $p.name } else { $p.shapeIndex }))
@@ -2826,7 +2967,7 @@ switch ($Action) {
     "setShapeText" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $slide.Shapes.Item($(if ($p.name) { $p.name } else { $p.shapeIndex }))
@@ -2837,7 +2978,7 @@ switch ($Action) {
     "setShapePosition" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $slide.Shapes.Item($(if ($p.name) { $p.name } else { $p.shapeIndex }))
@@ -2851,7 +2992,7 @@ switch ($Action) {
     "insertPptImage" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $left = if ($p.left) { $p.left } else { 100 }
@@ -2865,7 +3006,7 @@ switch ($Action) {
     "deletePptImage" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $slide.Shapes.Item($(if ($p.name) { $p.name } else { $p.shapeIndex }))
@@ -2873,10 +3014,33 @@ switch ($Action) {
         Output-Json @{ success = $true; data = @{ deleted = $(if ($p.name) { $p.name } else { $p.shapeIndex }) } }
     }
 
+    "replacePptImage" {
+        # 原位替换图片：保留原图位置/尺寸/旋转，删除旧图后在同一矩形插入新图（换图不动版式）
+        $ppt = Get-WpsPpt
+        if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
+        $pres = Get-TargetPres $ppt $p
+        if ($null -eq $pres) { Output-Json @{ success = $false; error = "No active presentation" }; exit }
+        $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
+        $slide = $pres.Slides.Item($slideIndex)
+        $sel = if ($p.name) { $p.name } else { $p.shapeIndex }
+        if ($null -eq $sel) { Output-Json @{ success = $false; error = "shapeIndex or name required" }; exit }
+        $newPath = if ($p.path) { $p.path } elseif ($p.filePath) { $p.filePath } else { $null }
+        if (-not $newPath) { Output-Json @{ success = $false; error = "path required" }; exit }
+        if (-not (Test-Path $newPath)) { Output-Json @{ success = $false; error = "image not found: $newPath" }; exit }
+        $old = $slide.Shapes.Item($sel)
+        $l = $old.Left; $t = $old.Top; $w = $old.Width; $h = $old.Height
+        $rot = 0
+        try { $rot = $old.Rotation } catch {}
+        $old.Delete()
+        $pic = $slide.Shapes.AddPicture($newPath, $false, $true, $l, $t, $w, $h)
+        try { $pic.Rotation = $rot } catch {}
+        Output-Json @{ success = $true; data = @{ name = $pic.Name; left = $l; top = $t; width = $w; height = $h; path = $newPath } }
+    }
+
     "setImageStyle" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $slide.Shapes.Item($(if ($p.name) { $p.name } else { $p.shapeIndex }))
@@ -2891,24 +3055,39 @@ switch ($Action) {
     "exportSlideAsImage" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
-        $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
+        $pres = Get-TargetPres $ppt $p
+        if ($null -eq $pres) { Output-Json @{ success = $false; error = "No target presentation (presentationName not found or no active presentation)" }; exit }
+        $slideIndex = if ($p.slideIndex) { [int]$p.slideIndex } else { 1 }
+        if ($slideIndex -lt 1 -or $slideIndex -gt $pres.Slides.Count) { Output-Json @{ success = $false; error = "slideIndex $slideIndex out of range (1..$($pres.Slides.Count)) in '$($pres.Name)'" }; exit }
         $slide = $pres.Slides.Item($slideIndex)
         $outputPath = if ($p.outputPath) { $p.outputPath } else { $p.path }
         if ([string]::IsNullOrEmpty($outputPath)) { Output-Json @{ success = $false; error = "Missing outputPath" }; exit }
+        # 确保父目录存在
+        $dir = Split-Path -Parent $outputPath
+        if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
         $rawFormat = if ($p.format) { $p.format.ToString().ToUpper() } else { "PNG" }
         # JPEG 在 PowerPoint COM 中按 JPG 滤镜处理
         $filterName = if ($rawFormat -eq "JPEG") { "JPG" } else { $rawFormat }
-        $width = if ($p.width) { $p.width } else { 1280 }
-        $height = if ($p.height) { $p.height } else { 720 }
-        $slide.Export($outputPath, $filterName, $width, $height)
-        Output-Json @{ success = $true; data = @{ slideIndex = $slideIndex; outputPath = $outputPath; format = $filterName; width = $width; height = $height } }
+        $width = if ($p.width) { [int]$p.width } else { 1280 }
+        $height = if ($p.height) { [int]$p.height } else { 720 }
+        try {
+            $slide.Export($outputPath, $filterName, $width, $height)
+        } catch {
+            Output-Json @{ success = $false; error = "Slide.Export failed: $($_.Exception.Message)" }; exit
+        }
+        # 关键修复：校验文件是否真生成，避免 Export 静默失败却报成功
+        if (Test-Path $outputPath) {
+            $bytes = (Get-Item $outputPath).Length
+            Output-Json @{ success = $true; data = @{ slideIndex = $slideIndex; outputPath = $outputPath; format = $filterName; width = $width; height = $height; bytes = $bytes; presentation = $pres.Name } }
+        } else {
+            Output-Json @{ success = $false; error = "Export 未抛错但文件未生成: $outputPath（WPS Slide.Export 可能不支持该 filter/尺寸参数或该路径）" }
+        }
     }
 
     "insertPptTable" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $rows = if ($p.rows) { $p.rows } else { 3 }
@@ -2924,7 +3103,7 @@ switch ($Action) {
     "setPptTableCell" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $null
@@ -2951,19 +3130,38 @@ switch ($Action) {
     "getPptTableCell" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
-        $shape = $slide.Shapes.Item($(if ($p.tableName) { $p.tableName } else { $p.tableIndex }))
-        $cell = $shape.Table.Cell($p.row, $p.col)
-        $value = $cell.Shape.TextFrame.TextRange.Text
-        Output-Json @{ success = $true; data = @{ row = $p.row; col = $p.col; value = $value } }
+        $shape = $null
+        $tableCount = 0
+        $targetIndex = if ($p.tableIndex) { $p.tableIndex } else { 1 }
+        if ($p.tableName) {
+            $shape = $slide.Shapes.Item($p.tableName)
+        } else {
+            for ($i = 1; $i -le $slide.Shapes.Count; $i++) {
+                $s = $slide.Shapes.Item($i)
+                if ($s.HasTable) {
+                    $tableCount++
+                    if ($tableCount -eq $targetIndex) { $shape = $s; break }
+                }
+            }
+        }
+        if ($null -eq $shape -or -not $shape.HasTable) { Output-Json @{ success = $false; error = "Table not found" }; exit }
+        $table = $shape.Table
+        $rowCount = $table.Rows.Count
+        $colCount = $table.Columns.Count
+        $value = $null
+        if ($null -ne $p.row -and $null -ne $p.col) {
+            try { $value = $table.Cell($p.row, $p.col).Shape.TextFrame.TextRange.Text } catch { $value = $null }
+        }
+        Output-Json @{ success = $true; data = @{ row = $p.row; col = $p.col; value = $value; rowCount = $rowCount; colCount = $colCount } }
     }
 
     "setPptTableStyle" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $slide.Shapes.Item($(if ($p.tableName) { $p.tableName } else { $p.tableIndex }))
@@ -2977,7 +3175,7 @@ switch ($Action) {
     "setPptTableCellStyle" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $null
@@ -3013,7 +3211,7 @@ switch ($Action) {
     "setPptTableRowStyle" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $null
@@ -3052,7 +3250,7 @@ switch ($Action) {
     "setShapeShadow" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $slide.Shapes.Item($(if ($p.name) { $p.name } else { $p.shapeIndex }))
@@ -3071,7 +3269,7 @@ switch ($Action) {
     "setBackgroundGradient" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $bg = $slide.Background.Fill
@@ -3091,7 +3289,7 @@ switch ($Action) {
     "setShapeGradient" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $slide.Shapes.Item($(if ($p.name) { $p.name } else { $p.shapeIndex }))
@@ -3110,7 +3308,7 @@ switch ($Action) {
     "setShapeBorder" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $slide.Shapes.Item($(if ($p.name) { $p.name } else { $p.shapeIndex }))
@@ -3125,7 +3323,7 @@ switch ($Action) {
     "setShapeTransparency" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $slide.Shapes.Item($(if ($p.name) { $p.name } else { $p.shapeIndex }))
@@ -3136,7 +3334,7 @@ switch ($Action) {
     "setShapeRoundness" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $slide.Shapes.Item($(if ($p.name) { $p.name } else { $p.shapeIndex }))
@@ -3147,7 +3345,7 @@ switch ($Action) {
     "setShapeFullStyle" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $slide.Shapes.Item($(if ($p.name) { $p.name } else { $p.shapeIndex }))
@@ -3161,7 +3359,7 @@ switch ($Action) {
     "alignShapes" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $alignMap = @{ left = 1; center = 2; right = 3; top = 4; middle = 5; bottom = 6 }
@@ -3175,7 +3373,7 @@ switch ($Action) {
     "distributeShapes" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $distMap = @{ horizontal = 0; vertical = 1 }
@@ -3189,7 +3387,7 @@ switch ($Action) {
     "groupShapes" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $range = $slide.Shapes.Range($p.names)
@@ -3200,7 +3398,7 @@ switch ($Action) {
     "duplicateShape" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $slide.Shapes.Item($(if ($p.name) { $p.name } else { $p.shapeIndex }))
@@ -3211,7 +3409,7 @@ switch ($Action) {
     "setShapeZOrder" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $slide.Shapes.Item($(if ($p.name) { $p.name } else { $p.shapeIndex }))
@@ -3225,7 +3423,7 @@ switch ($Action) {
     "insertPptChart" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $left = if ($p.left) { $p.left } else { 100 }
@@ -3239,7 +3437,7 @@ switch ($Action) {
     "addAnimation" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $slide.Shapes.Item($p.shapeName)
@@ -3250,7 +3448,7 @@ switch ($Action) {
     "setSlideTransition" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $slide.SlideShowTransition.EntryEffect = $p.effect
@@ -3260,7 +3458,7 @@ switch ($Action) {
     "setSlideBackground" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         if ($p.color) {
@@ -3277,7 +3475,7 @@ switch ($Action) {
     "slide.unifyFont" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $fontName = if ($p.fontName) { $p.fontName } else { "微软雅黑" }
         $count = 0
         $includeTitle = if ($null -ne $p.includeTitle) { [bool]$p.includeTitle } else { $true }
@@ -3307,7 +3505,7 @@ switch ($Action) {
     "addConnector" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $left = if ($p.left) { $p.left } else { 100 }
@@ -3321,7 +3519,7 @@ switch ($Action) {
     "addArrow" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $left = if ($p.left) { $p.left } else { 100 }
@@ -3335,7 +3533,7 @@ switch ($Action) {
     "applyColorScheme" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $schemeKey = if ($p.scheme) { $p.scheme } elseif ($p.colorScheme) { $p.colorScheme } else { "business" }
         $schemes = @{ business = @{ title = 0x2F5496; body = 0x333333 }; tech = @{ title = 0x00B0F0; body = 0x404040 }; creative = @{ title = 0xFF6B6B; body = 0x4A4A4A }; minimal = @{ title = 0x000000; body = 0x666666 } }
         $scheme = $schemes[$schemeKey]
@@ -3360,7 +3558,7 @@ switch ($Action) {
     "autoBeautifySlide" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { $ppt.ActiveWindow.Selection.SlideRange.SlideIndex }
         $slide = $pres.Slides.Item($slideIndex)
         $schemes = @{ business = @{ title = 0x2F5496; body = 0x333333 }; tech = @{ title = 0x00B0F0; body = 0x404040 }; creative = @{ title = 0xFF6B6B; body = 0x4A4A4A }; minimal = @{ title = 0x000000; body = 0x666666 } }
@@ -3384,7 +3582,7 @@ switch ($Action) {
     "createKpiCards" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
 
@@ -3427,7 +3625,7 @@ switch ($Action) {
     "createStyledTable" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
 
@@ -3487,7 +3685,7 @@ switch ($Action) {
     "addTitleDecoration" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
 
@@ -3505,7 +3703,7 @@ switch ($Action) {
     "addPageIndicator" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
 
@@ -3525,7 +3723,7 @@ switch ($Action) {
     "beautifyAllSlides" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $schemeKey = if ($p.style) { $p.style } else { "business" }
         $schemes = @{ business = @{ title = 0x2F5496; body = 0x333333 }; tech = @{ title = 0x00B0F0; body = 0x404040 }; creative = @{ title = 0xFF6B6B; body = 0x4A4A4A }; minimal = @{ title = 0x000000; body = 0x666666 } }
         $scheme = $schemes[$schemeKey]
@@ -3550,7 +3748,7 @@ switch ($Action) {
     "createProgressBar" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
 
@@ -3591,7 +3789,7 @@ switch ($Action) {
     "createGauge" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
 
@@ -3633,7 +3831,7 @@ switch ($Action) {
     "createMiniCharts" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
 
@@ -3680,7 +3878,7 @@ switch ($Action) {
     "createDonutChart" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
 
@@ -3723,7 +3921,7 @@ switch ($Action) {
     "autoLayout" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
 
@@ -3782,7 +3980,7 @@ switch ($Action) {
     "smartDistribute" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
 
@@ -3838,7 +4036,7 @@ switch ($Action) {
     "createGrid" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
 
@@ -3873,7 +4071,7 @@ switch ($Action) {
     "addAnimationPreset" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
 
@@ -3903,7 +4101,7 @@ switch ($Action) {
     "addEmphasisAnimation" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $slide.Shapes.Item($(if ($p.shapeName) { $p.shapeName } else { $p.shapeIndex }))
@@ -3922,7 +4120,7 @@ switch ($Action) {
     "createFlowChart" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
 
@@ -3987,7 +4185,7 @@ switch ($Action) {
     "createOrgChart" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
 
@@ -4043,7 +4241,7 @@ switch ($Action) {
     "createTimeline" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
 
@@ -4097,7 +4295,7 @@ switch ($Action) {
     "getSlideMaster" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $master = $pres.SlideMaster
         $masters = @()
         for ($i = 1; $i -le $master.Shapes.Count; $i++) {
@@ -4110,7 +4308,7 @@ switch ($Action) {
     "setMasterBackground" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $master = $pres.SlideMaster
         if ($p.gradient) {
             $master.Background.Fill.TwoColorGradient(1, 1)
@@ -4129,7 +4327,7 @@ switch ($Action) {
     "addMasterElement" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $master = $pres.SlideMaster
 
         $type = if ($p.type) { $p.type } else { "textbox" }
@@ -4159,7 +4357,7 @@ switch ($Action) {
     "set3DRotation" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $slide.Shapes.Item($(if ($p.shapeName) { $p.shapeName } else { $p.shapeIndex }))
@@ -4184,7 +4382,7 @@ switch ($Action) {
     "set3DDepth" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $slide.Shapes.Item($(if ($p.shapeName) { $p.shapeName } else { $p.shapeIndex }))
@@ -4207,7 +4405,7 @@ switch ($Action) {
     "set3DMaterial" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $slide.Shapes.Item($(if ($p.shapeName) { $p.shapeName } else { $p.shapeIndex }))
@@ -4223,7 +4421,7 @@ switch ($Action) {
     "create3DText" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
 
@@ -4256,7 +4454,7 @@ switch ($Action) {
     "setPptChartData" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $slide.Shapes.Item($(if ($p.chartName) { $p.chartName } else { $p.chartIndex }))
@@ -4277,7 +4475,7 @@ switch ($Action) {
     "setPptChartStyle" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $slide.Shapes.Item($(if ($p.chartName) { $p.chartName } else { $p.chartIndex }))
@@ -4295,7 +4493,7 @@ switch ($Action) {
     "removeAnimation" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $seq = $slide.TimeLine.MainSequence
@@ -4310,7 +4508,7 @@ switch ($Action) {
     "getAnimations" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $seq = $slide.TimeLine.MainSequence
@@ -4325,7 +4523,7 @@ switch ($Action) {
     "setAnimationOrder" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $seq = $slide.TimeLine.MainSequence
@@ -4337,7 +4535,7 @@ switch ($Action) {
     "removeSlideTransition" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $slide.SlideShowTransition.EntryEffect = 0
@@ -4347,7 +4545,7 @@ switch ($Action) {
     "applyTransitionToAll" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $transitionMap = @{ none = 0; fade = 1; push = 2; wipe = 3; split = 4; reveal = 5; random = 6 }
         $transition = if ($transitionMap[$p.transition]) { $transitionMap[$p.transition] } else { if ($p.transition) { $p.transition } else { 1 } }
         for ($i = 1; $i -le $pres.Slides.Count; $i++) {
@@ -4361,7 +4559,7 @@ switch ($Action) {
     "setBackgroundColor" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $colorValue = Convert-HexColorToRgbInt([string]$p.color)
         if ($p.applyToAll) {
             for ($i = 1; $i -le $pres.Slides.Count; $i++) {
@@ -4384,7 +4582,7 @@ switch ($Action) {
     "setBackgroundImage" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $slide.FollowMasterBackground = $false
@@ -4395,7 +4593,7 @@ switch ($Action) {
     "addPptHyperlink" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $slide.Shapes.Item($(if ($p.shapeName) { $p.shapeName } else { $p.shapeIndex }))
@@ -4408,7 +4606,7 @@ switch ($Action) {
     "removePptHyperlink" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $slide.Shapes.Item($(if ($p.shapeName) { $p.shapeName } else { $p.shapeIndex }))
@@ -4419,7 +4617,7 @@ switch ($Action) {
     "setSlideNumber" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         if ($null -ne $p.visible) { $pres.SlideMaster.HeadersFooters.SlideNumber.Visible = $p.visible }
         Output-Json @{ success = $true; data = @{ visible = $p.visible } }
     }
@@ -4427,7 +4625,7 @@ switch ($Action) {
     "setPptFooter" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $pres.SlideMaster.HeadersFooters.Footer.Visible = $true
         $pres.SlideMaster.HeadersFooters.Footer.Text = if ($p.text) { $p.text } else { "" }
         Output-Json @{ success = $true; data = @{ text = $p.text } }
@@ -4436,7 +4634,7 @@ switch ($Action) {
     "setPptDateTime" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $pres.SlideMaster.HeadersFooters.DateAndTime.Visible = if ($p.visible -ne $null) { $p.visible } else { $true }
         if ($p.useFixed) {
             $pres.SlideMaster.HeadersFooters.DateAndTime.UseFormat = $false
@@ -4448,7 +4646,7 @@ switch ($Action) {
     "findPptText" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $results = @()
         for ($i = 1; $i -le $pres.Slides.Count; $i++) {
             $slide = $pres.Slides.Item($i)
@@ -4470,30 +4668,28 @@ switch ($Action) {
     "replacePptText" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
+        if ($null -eq $pres) { Output-Json @{ success = $false; error = "No target presentation" }; exit }
+        # 兼容两种参数名：TS 工具发送 find/replace，旧实现读 findText/replaceText（此前不匹配导致 0 替换）
+        $findText = if ($null -ne $p.find) { [string]$p.find } else { [string]$p.findText }
+        $replaceText = if ($null -ne $p.replace) { [string]$p.replace } elseif ($null -ne $p.replaceText) { [string]$p.replaceText } else { "" }
+        if ([string]::IsNullOrEmpty($findText)) { Output-Json @{ success = $false; error = "find text required" }; exit }
         $count = 0
         for ($i = 1; $i -le $pres.Slides.Count; $i++) {
             $slide = $pres.Slides.Item($i)
             for ($j = 1; $j -le $slide.Shapes.Count; $j++) {
                 $shape = $slide.Shapes.Item($j)
-                try {
-                    if ($shape.HasTextFrame -and $shape.TextFrame.HasText) {
-                        $text = $shape.TextFrame.TextRange.Text
-                        if ($text -and $text.Contains($p.findText)) {
-                            $shape.TextFrame.TextRange.Text = $text.Replace($p.findText, $(if ($p.replaceText) { $p.replaceText } else { "" }))
-                            $count++
-                        }
-                    }
-                } catch {}
+                # 递归处理：文本框 + 表格单元格 + 组合(Group)内所有子形状
+                $count += Replace-InShapeTree $shape $findText $replaceText
             }
         }
-        Output-Json @{ success = $true; data = @{ findText = $p.findText; replaceText = $p.replaceText; count = $count } }
+        Output-Json @{ success = $true; data = @{ findText = $findText; replaceText = $replaceText; count = $count } }
     }
 
     "startSlideShow" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $pres.SlideShowSettings.Run()
         Output-Json @{ success = $true }
     }
@@ -4508,7 +4704,7 @@ switch ($Action) {
     "unifyFont" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $fontName = if ($p.fontName) { $p.fontName } else { "微软雅黑" }
         $count = 0
         for ($i = 1; $i -le $pres.Slides.Count; $i++) {
@@ -4529,7 +4725,7 @@ switch ($Action) {
     "slide.beautify" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $schemes = @{
             business = @{ title = 0x2F5496; body = 0x333333 }
             tech = @{ title = 0x00B0F0; body = 0x404040 }
@@ -4575,7 +4771,7 @@ switch ($Action) {
     "set3DRotation" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { [int]$p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $slide.Shapes.Item($(if ($p.shapeName) { $p.shapeName } elseif ($p.shapeIndex) { [int]$p.shapeIndex } else { 1 }))
@@ -4602,7 +4798,7 @@ switch ($Action) {
     "set3DDepth" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { [int]$p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $slide.Shapes.Item($(if ($p.shapeName) { $p.shapeName } elseif ($p.shapeIndex) { [int]$p.shapeIndex } else { 1 }))
@@ -4623,7 +4819,7 @@ switch ($Action) {
     "set3DMaterial" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { [int]$p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $shape = $slide.Shapes.Item($(if ($p.shapeName) { $p.shapeName } elseif ($p.shapeIndex) { [int]$p.shapeIndex } else { 1 }))
@@ -4638,7 +4834,7 @@ switch ($Action) {
     "create3DText" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { [int]$p.slideIndex } else { 1 }
         $slide = $pres.Slides.Item($slideIndex)
         $text = if ($p.text) { $p.text } else { "3D文字" }
@@ -4664,7 +4860,7 @@ switch ($Action) {
     "beautifySlide" {
         $ppt = Get-WpsPpt
         if ($null -eq $ppt) { Output-Json @{ success = $false; error = "WPS PPT not running" }; exit }
-        $pres = $ppt.ActivePresentation
+        $pres = Get-TargetPres $ppt $p
         $slideIndex = if ($p.slideIndex) { $p.slideIndex } else { $ppt.ActiveWindow.Selection.SlideRange.SlideIndex }
         $slide = $pres.Slides.Item($slideIndex)
         $schemes = @{

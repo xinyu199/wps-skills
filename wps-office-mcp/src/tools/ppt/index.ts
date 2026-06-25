@@ -165,6 +165,10 @@ export {
   copySlideHandler,
   insertSlideImageDefinition,
   insertSlideImageHandler,
+  insertSlidesFromFileDefinition,
+  insertSlidesFromFileHandler,
+  setActiveTargetDefinition,
+  setActiveTargetHandler,
 } from './presentation';
 
 export {
@@ -235,6 +239,8 @@ export {
   setImageStyleHandler,
   exportSlideAsImageDefinition,
   exportSlideAsImageHandler,
+  replacePptImageDefinition,
+  replacePptImageHandler,
 } from './image';
 
 export {
