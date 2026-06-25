@@ -203,5 +203,6 @@ venv/
 
 # 其他 Claude 相关文件
 CLAUDE.md
+CHANGELOG.md
 .claude
 .spec-workflow
